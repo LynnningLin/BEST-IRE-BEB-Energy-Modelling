@@ -1,0 +1,258 @@
+"""
+beb_soc_model.py
+================================================================================
+Segment-level (stop-to-stop) Battery Electric Bus energy & State-of-Charge model.
+
+WHAT THIS IS
+------------
+A *quasi-static, backward-facing* longitudinal vehicle model. "Backward-facing"
+means we assume the bus follows a known speed profile and we work *backwards* to
+the power the battery must supply -- no driver/controller model needed, so it is
+fast, deterministic, and easy to run thousands of times inside an optimisation.
+
+It does the two jobs we talked about:
+  1. ROUTE -> MOTION : turn each stop-to-stop segment (length, grade, dwell) into
+                       a speed-vs-time profile.
+  2. MOTION -> ENERGY -> SoC : turn that motion into a battery power demand, then
+                       deplete the battery and track State of Charge.
+
+The physics is just a force balance at the wheels:
+
+    F_traction = F_rolling + F_aero + F_grade + F_inertia
+
+    F_rolling  = Crr * m * g * cos(theta)        (tyres)
+    F_aero     = 0.5 * rho * Cd * A * v^2         (air drag)
+    F_grade    = m * g * sin(theta)               (the hill)
+    F_inertia  = m * lambda * a                    (speeding up / slowing down)
+
+Wheel power P = F_traction * v. We then convert to battery power through the
+drivetrain/motor efficiency (when accelerating) or recover part of it through
+regenerative braking (when slowing down), add a constant auxiliary/HVAC load,
+and integrate to get energy. SoC is energy-based Coulomb counting:
+
+    SoC(t) = SoC0 - (cumulative battery energy / usable capacity) * 100
+
+References for the approach (for your lit review):
+  - Kunith et al. (2017), segment-level energy feeding charger-placement MILP.
+  - NREL FASTSim, a validated backward-facing vehicle energy model.
+
+HOW TO PLUG IN REAL DATA
+------------------------
+Replace make_synthetic_route() with a function that returns a list of Segment
+objects built from your GTFS feed (segment length, scheduled speed, dwell) and a
+DEM (average grade per segment). Nothing else needs to change. Swapping synthetic
+-> real data is just swapping the input list.
+================================================================================
+"""
+
+from dataclasses import dataclass, field
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")  # no display needed; we save figures to file
+import matplotlib.pyplot as plt
+
+
+# ----------------------------------------------------------------------------- 
+# 1. PARAMETERS  (placeholder values for a ~12 m city BEB -- edit these)
+# -----------------------------------------------------------------------------
+@dataclass
+class VehicleParams:
+    curb_mass_kg: float = 13_500.0     # empty bus incl. battery (12 m BEB)
+    passenger_mass_kg: float = 70.0    # mass per passenger
+    frontal_area_m2: float = 8.0       # ~2.5 m wide x ~3.2 m tall
+    drag_coeff: float = 0.60           # Cd, typical city bus
+    roll_coeff: float = 0.008          # Crr, tyres on asphalt
+    rot_inertia_factor: float = 1.05   # lambda: accounts for rotating masses
+    eta_driveline: float = 0.92        # gearbox/axle efficiency
+    eta_motor: float = 0.90            # motor + inverter efficiency
+    regen_fraction: float = 0.60       # fraction of braking energy recovered
+    aux_power_kW: float = 5.0          # HVAC + lights + control. Raise for winter.
+    battery_usable_kWh: float = 300.0  # usable pack energy
+    air_density: float = 1.225         # kg/m^3
+    g: float = 9.81                    # m/s^2
+
+
+@dataclass
+class Segment:
+    """One stop-to-stop link."""
+    length_m: float          # distance to the next stop
+    grade: float = 0.0       # rise/run as a fraction (0.03 = +3% uphill)
+    v_cruise_ms: float = 11.0  # free-flow cruising speed (m/s). 11 m/s ~ 40 km/h
+    dwell_s: float = 20.0    # time stopped at the *end* stop (doors open)
+    passengers: int = 20     # average occupancy on this segment
+
+
+# ----------------------------------------------------------------------------- 
+# 2. ROUTE -> MOTION : build a speed profile for one segment
+# -----------------------------------------------------------------------------
+def build_speed_profile(seg: Segment, a_accel=1.0, a_decel=1.2, dt=0.5):
+    """
+    Return arrays (t, v, a) for the *driving* part of the segment, using a simple
+    trapezoidal profile: accelerate -> (cruise) -> decelerate to a stop.
+    Falls back to a triangular profile on segments too short to reach v_cruise.
+    a_accel, a_decel in m/s^2 ; dt = time step in seconds.
+    """
+    v_c = seg.v_cruise_ms
+    d_acc = v_c**2 / (2 * a_accel)          # distance to reach cruise speed
+    d_dec = v_c**2 / (2 * a_decel)          # distance to brake from cruise
+
+    if d_acc + d_dec <= seg.length_m:
+        # Trapezoidal: there is room to cruise.
+        d_cruise = seg.length_m - d_acc - d_dec
+        t_acc = v_c / a_accel
+        t_cruise = d_cruise / v_c
+        t_dec = v_c / a_decel
+        v_peak = v_c
+    else:
+        # Triangular: segment too short, never reach cruise speed.
+        v_peak = np.sqrt(2 * seg.length_m * a_accel * a_decel / (a_accel + a_decel))
+        t_acc = v_peak / a_accel
+        t_cruise = 0.0
+        t_dec = v_peak / a_decel
+
+    total_t = t_acc + t_cruise + t_dec
+    t = np.arange(0, total_t, dt)
+    v = np.zeros_like(t)
+    a = np.zeros_like(t)
+
+    for i, ti in enumerate(t):
+        if ti < t_acc:                       # accelerating
+            a[i] = a_accel
+            v[i] = a_accel * ti
+        elif ti < t_acc + t_cruise:          # cruising
+            a[i] = 0.0
+            v[i] = v_peak
+        else:                                # decelerating
+            a[i] = -a_decel
+            v[i] = v_peak - a_decel * (ti - t_acc - t_cruise)
+
+    v = np.clip(v, 0.0, None)
+    return t, v, a, dt
+
+
+# ----------------------------------------------------------------------------- 
+# 3. MOTION -> ENERGY : battery energy used over one segment
+# -----------------------------------------------------------------------------
+def segment_energy_kWh(seg: Segment, p: VehicleParams):
+    """Return battery energy (kWh) for one segment, including dwell aux load."""
+    m = p.curb_mass_kg + seg.passengers * p.passenger_mass_kg
+    theta = np.arctan(seg.grade)
+    aux_W = p.aux_power_kW * 1000.0
+
+    t, v, a, dt = build_speed_profile(seg)
+
+    E_joules = 0.0
+    for vi, ai in zip(v, a):
+        moving = vi > 0.01
+        F_roll  = p.roll_coeff * m * p.g * np.cos(theta) * moving
+        F_aero  = 0.5 * p.air_density * p.drag_coeff * p.frontal_area_m2 * vi**2
+        F_grade = m * p.g * np.sin(theta) * moving
+        F_inert = m * p.rot_inertia_factor * ai
+        F_trac = F_roll + F_aero + F_grade + F_inert
+
+        P_wheel = F_trac * vi  # mechanical power at the wheels (W)
+
+        if P_wheel >= 0:
+            # Drawing power: divide by efficiencies (losses make it cost more).
+            P_batt = P_wheel / (p.eta_driveline * p.eta_motor) + aux_W
+        else:
+            # Braking: recover a fraction back into the battery (P_wheel is < 0).
+            P_batt = P_wheel * (p.eta_driveline * p.eta_motor) * p.regen_fraction + aux_W
+
+        E_joules += P_batt * dt
+
+    # Dwell at the stop: bus stationary, only auxiliary load draws power.
+    E_joules += aux_W * seg.dwell_s
+
+    return E_joules / 3.6e6  # joules -> kWh
+
+
+# ----------------------------------------------------------------------------- 
+# 4. Simulate a whole route and track SoC
+# -----------------------------------------------------------------------------
+def simulate_route(segments, p: VehicleParams, soc0_pct=100.0):
+    rows = []
+    soc = soc0_pct
+    cum_dist_km = 0.0
+    for i, seg in enumerate(segments):
+        E = segment_energy_kWh(seg, p)
+        soc_before = soc
+        soc -= E / p.battery_usable_kWh * 100.0
+        soc = min(soc, 100.0)  # a real BMS caps charging at 100%
+        cum_dist_km += seg.length_m / 1000.0
+        rows.append({
+            "segment": i,
+            "length_m": round(seg.length_m, 1),
+            "grade_%": round(seg.grade * 100, 2),
+            "passengers": seg.passengers,
+            "energy_kWh": round(E, 3),
+            "kWh_per_km": round(E / (seg.length_m / 1000.0), 3),
+            "cum_dist_km": round(cum_dist_km, 3),
+            "SoC_start_%": round(soc_before, 2),
+            "SoC_end_%": round(soc, 2),
+        })
+    return pd.DataFrame(rows)
+
+
+# ----------------------------------------------------------------------------- 
+# 5. SYNTHETIC ROUTE  (replace this with your GTFS + DEM loader)
+# -----------------------------------------------------------------------------
+def make_synthetic_route(n_segments=40, seed=42):
+    """
+    Build a plausible urban route with deliberate spatial heterogeneity, so the
+    downstream charger-placement optimisation has something non-trivial to solve.
+    """
+    rng = np.random.default_rng(seed)
+    segments = []
+    for _ in range(n_segments):
+        length = rng.uniform(300, 650)            # urban stop spacing (m)
+        grade = rng.normal(0.0, 0.02)             # mostly flat, some hills (+-)
+        grade = float(np.clip(grade, -0.06, 0.06))
+        v_cruise = rng.uniform(8.5, 13.5)         # 30-49 km/h free-flow
+        dwell = rng.uniform(12, 30)               # seconds at the stop
+        pax = int(rng.integers(8, 45))            # occupancy
+        segments.append(Segment(length, grade, v_cruise, dwell, pax))
+    return segments
+
+
+# ----------------------------------------------------------------------------- 
+# 6. RUN
+# -----------------------------------------------------------------------------
+def main():
+    p = VehicleParams()
+    segments = make_synthetic_route()
+    df = simulate_route(segments, p, soc0_pct=100.0)
+
+    total_E = df["energy_kWh"].sum()
+    total_km = df["cum_dist_km"].iloc[-1]
+    print(df.to_string(index=False))
+    print("\n--- Route summary ---")
+    print(f"Segments              : {len(df)}")
+    print(f"Total distance        : {total_km:.2f} km")
+    print(f"Total energy          : {total_E:.2f} kWh")
+    print(f"Average consumption   : {total_E / total_km:.3f} kWh/km")
+    print(f"SoC at end of route   : {df['SoC_end_%'].iloc[-1]:.1f} %")
+
+    df.to_csv("beb_segment_results.csv", index=False)
+
+    # Plot SoC and per-segment consumption against distance.
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 7), sharex=True)
+    ax1.plot(df["cum_dist_km"], df["SoC_end_%"], marker="o", ms=3)
+    ax1.set_ylabel("State of Charge (%)")
+    ax1.set_title("BEB State of Charge along the route")
+    ax1.grid(True, alpha=0.3)
+
+    ax2.bar(df["cum_dist_km"], df["kWh_per_km"], width=0.2)
+    ax2.set_ylabel("Consumption (kWh/km)")
+    ax2.set_xlabel("Cumulative distance (km)")
+    ax2.set_title("Per-segment energy consumption")
+    ax2.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig("beb_soc_trace.png", dpi=130)
+    print("\nSaved: beb_segment_results.csv  and  beb_soc_trace.png")
+
+
+if __name__ == "__main__":
+    main()
