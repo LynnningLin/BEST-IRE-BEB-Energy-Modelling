@@ -8,7 +8,7 @@ It does the ROUTE -> MOTION inputs job from real data:
   * segment length   <- distance between consecutive stops (stops.txt)
   * dwell time        <- departure - arrival at each stop (stop_times.txt)
   * cruise speed      <- scheduled run time between stops -> average speed
-  * grade             <- NOT in GTFS. Left at 0.0; see add_grades_from_dem().
+  * grade             <- sampled from SRTM elevations (see add_grades_from_dem).
   * passengers        <- NOT in GTFS. Set by assumption; replace with APC later.
 
 Designed for a LARGE national feed (the Irish/NTA feed has a 372 MB
@@ -35,6 +35,7 @@ from math import radians, sin, cos, asin, sqrt
 from pathlib import Path
 
 import pandas as pd
+import srtm  # SRTM elevation tiles, same source RouteZero uses for grades
 
 # Reuse the vehicle model and Segment dataclass from the sibling file.
 from beb_soc_model import Segment, VehicleParams, simulate_route
@@ -44,8 +45,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_GTFS = PROJECT_ROOT / "data" / "raw" / "GTFS_Realtime.zip"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "processed"
 
+# Where SRTM .hgt tiles are cached on disk so they download only once.
+DEFAULT_SRTM_CACHE = PROJECT_ROOT / "data" / "srtm_cache"
 
-# ----------------------------------------------------------------------------- 
+
+# -----------------------------------------------------------------------------
 # Small helpers
 # -----------------------------------------------------------------------------
 def gtfs_time_to_seconds(t: str) -> int:
@@ -66,7 +70,7 @@ def haversine_m(lat1, lon1, lat2, lon2) -> float:
     return 2 * R * asin(sqrt(a))
 
 
-# ----------------------------------------------------------------------------- 
+# -----------------------------------------------------------------------------
 # Read small tables
 # -----------------------------------------------------------------------------
 def load_small_tables(gtfs_zip: str):
@@ -101,7 +105,7 @@ def safe_route_name(route_short_name) -> str:
     return cleaned.strip("._") or "route"
 
 
-# ----------------------------------------------------------------------------- 
+# -----------------------------------------------------------------------------
 # Stream the big stop_times.txt, keeping only one trip
 # -----------------------------------------------------------------------------
 def stop_times_for_trip(gtfs_zip: str, trip_id: str, assume_grouped=True):
@@ -125,25 +129,39 @@ def stop_times_for_trip(gtfs_zip: str, trip_id: str, assume_grouped=True):
     return rows
 
 
-# ----------------------------------------------------------------------------- 
+# -----------------------------------------------------------------------------
 # Build the Segment list
 # -----------------------------------------------------------------------------
-def build_segments(trip_rows, stops, passengers=20, cruise_factor=1.15,
-                   v_min=3.0, v_max=22.0):
+def iter_valid_stop_pairs(trip_rows, stops):
     """
-    Convert ordered stop_times rows into a list of Segment objects.
-    cruise_factor scales the schedule-implied *average* speed up toward a
-    free-flow *cruise* speed (the trapezoidal profile spends time accelerating).
+    Yield (row_a, row_b, length_m) for every consecutive stop pair that survives
+    the co-located-stop filter (length >= 1 m).
+
+    build_segments AND add_grades_from_dem both consume this, so the i-th
+    segment always corresponds to the i-th yielded pair. Without this shared
+    source of truth the two passes drift apart whenever a duplicate stop is
+    dropped, and grades get attached to the wrong segments.
     """
     coord = stops.set_index("stop_id")[["stop_lat", "stop_lon"]].to_dict("index")
-    segments = []
     for a, b in zip(trip_rows[:-1], trip_rows[1:]):
         sa, sb = coord[a["stop_id"]], coord[b["stop_id"]]
         length_m = haversine_m(sa["stop_lat"], sa["stop_lon"],
                                sb["stop_lat"], sb["stop_lon"])
         if length_m < 1:
             continue  # duplicate / co-located stop
+        yield a, b, length_m
 
+
+def build_segments(trip_rows, stops, passengers=20, cruise_factor=1.15,
+                   v_min=3.0, v_max=22.0):
+    """
+    Convert ordered stop_times rows into a list of Segment objects.
+    cruise_factor scales the schedule-implied *average* speed up toward a
+    free-flow *cruise* speed (the trapezoidal profile spends time accelerating).
+    Grade is left at 0.0 here and filled later by add_grades_from_dem().
+    """
+    segments = []
+    for a, b, length_m in iter_valid_stop_pairs(trip_rows, stops):
         run_time = gtfs_time_to_seconds(b["arrival_time"]) - \
                    gtfs_time_to_seconds(a["departure_time"])
         if run_time > 0:
@@ -161,25 +179,91 @@ def build_segments(trip_rows, stops, passengers=20, cruise_factor=1.15,
     return segments
 
 
-def add_grades_from_dem(segments, trip_rows, stops, dem_path=None):
+def add_grades_from_dem(segments, trip_rows, stops, dem_path=None,
+                        elevation_data=None, srtm_cache_dir=None,
+                        max_abs_grade=0.15, verbose=True):
     """
-    STUB / hook. GTFS has no elevation, so grade defaults to 0.0 above.
-    To add real grade you need a Digital Elevation Model (e.g. Copernicus
-    GLO-30 or SRTM). The logic would be:
-        1. for each stop, sample DEM elevation at (lat, lon)  [rasterio]
-        2. grade = (elev_next - elev_this) / segment_length
-        3. write seg.grade = grade
-    Left unimplemented because no DEM was provided. Flat terrain (grade=0)
-    until you wire this up.
+    Fill each Segment.grade from SRTM elevations, the same data source RouteZero
+    uses (`srtm.get_data().get_elevation(lat, lon)`).
+
+        grade = (elev_end_stop - elev_start_stop) / segment_length   [rise/run]
+
+    UNITS: grade is a dimensionless fraction (rise/run), matching this file's
+    original docstring. RouteZero reports *percent* (this value * 100). If
+    beb_soc_model expects percent or degrees instead, convert here -- getting
+    the unit wrong rescales the gravitational term by 100x.
+
+    Elevation is sampled once per unique stop (cached). Segments are aligned to
+    the SAME pairs build_segments used, via iter_valid_stop_pairs, so a dropped
+    co-located stop never shifts grades onto the wrong segment.
+
+    SRTM gaps: get_elevation() returns None over water or where a tile is
+    missing/unreachable. Such segments are left flat (grade 0.0) and counted, so
+    a network/coverage problem is visible instead of silently corrupting energy.
+
+    Note vs RouteZero: it computes grade over a whole TRIP (long baseline, so
+    90 m SRTM noise averages out). Here grade is per stop-to-stop SEGMENT, which
+    can be a couple hundred metres, so SRTM noise is proportionally larger --
+    hence the max_abs_grade clamp. Pass max_abs_grade=None to disable it.
     """
+    pairs = list(iter_valid_stop_pairs(trip_rows, stops))
+    if len(pairs) != len(segments):
+        raise ValueError(
+            f"segment/pair mismatch ({len(segments)} vs {len(pairs)}); "
+            "build_segments and add_grades_from_dem are out of sync."
+        )
+    if not segments:
+        return segments
+
+    if elevation_data is None:
+        cache_dir = str(srtm_cache_dir) if srtm_cache_dir else ""
+        elevation_data = srtm.get_data(local_cache_dir=cache_dir)
+
+    coord = stops.set_index("stop_id")[["stop_lat", "stop_lon"]].to_dict("index")
+    elev_cache = {}
+
+    def elevation_of(stop_id):
+        if stop_id not in elev_cache:
+            c = coord[stop_id]
+            elev_cache[stop_id] = elevation_data.get_elevation(
+                latitude=c["stop_lat"], longitude=c["stop_lon"])
+        return elev_cache[stop_id]
+
+    filled = 0
+    missing = 0
+    grades = []
+    for seg, (a, b, length_m) in zip(segments, pairs):
+        ea = elevation_of(a["stop_id"])
+        eb = elevation_of(b["stop_id"])
+        if ea is None or eb is None or length_m <= 0:
+            seg.grade = 0.0
+            missing += 1
+            continue
+        g = (eb - ea) / length_m
+        if max_abs_grade is not None:
+            g = max(-max_abs_grade, min(max_abs_grade, g))
+        seg.grade = g
+        filled += 1
+        grades.append(g)
+
+    if verbose:
+        if grades:
+            print(f"  grades: filled {filled}/{len(segments)} segments from SRTM "
+                  f"(range {min(grades) * 100:+.1f}%..{max(grades) * 100:+.1f}%, "
+                  f"mean {sum(grades) / len(grades) * 100:+.2f}%)"
+                  + (f"; {missing} left flat (no SRTM value)" if missing else ""))
+        else:
+            print("  grades: SRTM returned no usable elevations -> all flat. "
+                  "Check network access / tile coverage for this area.")
     return segments
 
 
-# ----------------------------------------------------------------------------- 
+# -----------------------------------------------------------------------------
 # Convenience: name -> segments in one call
 # -----------------------------------------------------------------------------
 def segments_for_route(gtfs_zip, route_short_name, direction_id=0,
-                       passengers=20, tables=None):
+                       passengers=20, tables=None, elevation_data=None,
+                       srtm_cache_dir=None):
     if tables is None:
         routes, trips, stops = load_small_tables(gtfs_zip)
     else:
@@ -188,7 +272,9 @@ def segments_for_route(gtfs_zip, route_short_name, direction_id=0,
                                                route_short_name, direction_id)
     trip_rows = stop_times_for_trip(gtfs_zip, trip_id)
     segs = build_segments(trip_rows, stops, passengers=passengers)
-    segs = add_grades_from_dem(segs, trip_rows, stops)  # no-op until DEM added
+    segs = add_grades_from_dem(segs, trip_rows, stops,
+                               elevation_data=elevation_data,
+                               srtm_cache_dir=srtm_cache_dir)
     print(f"Route {route_short_name}  ({long_name})")
     print(f"  trip_id           : {trip_id}")
     print(f"  stops in trip     : {len(trip_rows)}")
@@ -213,7 +299,8 @@ def route_results_dataframe(segs, route_info, vehicle_params=None, soc0_pct=100.
 
 
 def process_route(gtfs_zip, route_short_name, output_dir, direction_id=0,
-                  passengers=20, tables=None, vehicle_params=None):
+                  passengers=20, tables=None, vehicle_params=None,
+                  elevation_data=None, srtm_cache_dir=None):
     """Build, simulate, and save one route to its own CSV file."""
     segs, route_info = segments_for_route(
         gtfs_zip,
@@ -221,6 +308,8 @@ def process_route(gtfs_zip, route_short_name, output_dir, direction_id=0,
         direction_id=direction_id,
         passengers=passengers,
         tables=tables,
+        elevation_data=elevation_data,
+        srtm_cache_dir=srtm_cache_dir,
     )
     df = route_results_dataframe(segs, route_info, vehicle_params=vehicle_params)
 
@@ -231,7 +320,7 @@ def process_route(gtfs_zip, route_short_name, output_dir, direction_id=0,
 
     total_E = df["energy_kWh"].sum()
     total_km = df["cum_dist_km"].iloc[-1]
-    print("\n--- Route summary (flat grade until DEM added) ---")
+    print("\n--- Route summary (grades from SRTM) ---")
     print(f"Total distance      : {total_km:.2f} km")
     print(f"Total energy        : {total_E:.2f} kWh")
     print(f"Average consumption : {total_E / total_km:.3f} kWh/km")
@@ -290,10 +379,15 @@ def parse_args():
         default=20,
         help="Assumed passengers per segment. Default: 20.",
     )
+    parser.add_argument(
+        "--srtm-cache-dir",
+        default=str(DEFAULT_SRTM_CACHE),
+        help=f"Directory to cache SRTM tiles. Default: {DEFAULT_SRTM_CACHE}",
+    )
     return parser.parse_args()
 
 
-# ----------------------------------------------------------------------------- 
+# -----------------------------------------------------------------------------
 # Demo
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
@@ -308,6 +402,10 @@ if __name__ == "__main__":
     tables = load_small_tables(gtfs_zip)
     vehicle_params = VehicleParams()
 
+    # Build the SRTM reader once and reuse it for every route (tiles are cached
+    # on disk in srtm_cache_dir, so repeated runs don't re-download).
+    elevation_data = srtm.get_data(local_cache_dir=str(args.srtm_cache_dir))
+
     saved_paths = []
     for route_short_name in route_short_names:
         saved_paths.append(
@@ -319,6 +417,8 @@ if __name__ == "__main__":
                 passengers=args.passengers,
                 tables=tables,
                 vehicle_params=vehicle_params,
+                elevation_data=elevation_data,
+                srtm_cache_dir=args.srtm_cache_dir,
             )
         )
 
