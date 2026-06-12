@@ -1,0 +1,6 @@
+name: beb-energy
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+prefix: /Users/lynnning/miniforge3/envs/beb-energy
