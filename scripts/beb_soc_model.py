@@ -58,17 +58,17 @@ import matplotlib.pyplot as plt
 # -----------------------------------------------------------------------------
 @dataclass
 class VehicleParams:
-    curb_mass_kg: float = 13_500.0     # empty bus incl. battery (12 m BEB)
+    curb_mass_kg: float = 14_000.0     # empty bus incl. battery (12 m BEB)
     passenger_mass_kg: float = 70.0    # mass per passenger
-    frontal_area_m2: float = 8.0       # ~2.5 m wide x ~3.2 m tall
-    drag_coeff: float = 0.60           # Cd, typical city bus
-    roll_coeff: float = 0.008          # Crr, tyres on asphalt
+    frontal_area_m2: float = 10.8       # ~2.55 m wide x ~4.25 m high
+    drag_coeff: float = 0.70           # Cd, typical city bus
+    roll_coeff: float = 0.0085          # Crr, tyres on asphalt
     rot_inertia_factor: float = 1.05   # lambda: accounts for rotating masses
     eta_driveline: float = 0.92        # gearbox/axle efficiency
     eta_motor: float = 0.90            # motor + inverter efficiency
     regen_fraction: float = 0.60       # fraction of braking energy recovered
-    aux_power_kW: float = 5.0          # HVAC + lights + control. Raise for winter.
-    battery_usable_kWh: float = 300.0  # usable pack energy
+    aux_power_kW: float = 7.0          # HVAC + lights + control. Raise for winter.
+    battery_usable_kWh: float = 410.0  # approx. 454-472 kWh gross pack
     air_density: float = 1.225         # kg/m^3
     g: float = 9.81                    # m/s^2
 

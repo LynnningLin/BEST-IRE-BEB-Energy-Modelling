@@ -106,21 +106,98 @@ def trapezoid_shape(frac, board_frac=0.2, alight_frac=0.2, floor_frac=0.0):
     return floor_frac + (1.0 - floor_frac) * m
 
 
+def _beta_weights(positions, mode, concentration):
+    """
+    Beta-density weights (summing to 1) over `positions` in [0, 1], peaked near
+    `mode`. Higher `concentration` => tighter peak. Used to spread boardings and
+    alightings along the route without any external stats dependency.
+    """
+    c = max(float(concentration), 2.0001)          # >2 keeps an interior peak
+    a = 1.0 + (c - 2.0) * mode
+    b = 1.0 + (c - 2.0) * (1.0 - mode)
+    w = []
+    for x in positions:
+        x = min(max(float(x), 1e-6), 1.0 - 1e-6)
+        w.append(x ** (a - 1.0) * (1.0 - x) ** (b - 1.0))
+    s = sum(w)
+    return [wi / s for wi in w] if s > 0 else [1.0 / len(w)] * len(w)
+
+
+def occupancy_from_boarding_alighting(stop_fracs, board_pos=0.25, alight_pos=0.75,
+                                      concentration=6.0, floor_frac=0.0):
+    """
+    Realistic load shape, built the way occupancy actually arises:
+
+        occupancy(segment) = (everyone boarded so far) - (everyone alighted so far)
+
+    Boardings are spread along the route with a density peaked near `board_pos`
+    (front-loaded), alightings near `alight_pos` (back-loaded). The running
+    difference is naturally ~empty at both ends and fullest where the boarding
+    lead over alighting is largest -- the "busy middle". Move board_pos /
+    alight_pos to place that busy zone (e.g. alight_pos high for a radial route
+    that fills toward a city-centre terminus). This is exactly the structure of
+    APC ons/offs data, so measured counts can replace the two Beta densities
+    later with no change downstream.
+
+    stop_fracs : cumulative distance fraction at each STOP, 0.0..1.0
+                 (length = n_segments + 1).
+    Returns one multiplier in [floor_frac, 1] per SEGMENT (normalised so the
+    busiest segment == 1).
+    """
+    n_seg = len(stop_fracs) - 1
+    if n_seg <= 0:
+        return []
+    on_w = _beta_weights(stop_fracs[:-1], board_pos, concentration)   # stops 0..N-1
+    off_w = _beta_weights(stop_fracs[1:], alight_pos, concentration)  # stops 1..N
+
+    occ = []
+    cum_on = cum_off = 0.0
+    for j in range(n_seg):
+        cum_on += on_w[j]
+        if j >= 1:
+            cum_off += off_w[j - 1]
+        occ.append(max(cum_on - cum_off, 0.0))   # clamp tiny negatives
+
+    mx = max(occ) if occ else 0.0
+    if mx <= 0:
+        return [0.0] * n_seg
+    return [floor_frac + (1.0 - floor_frac) * (o / mx) for o in occ]
+
+
+def _stop_fractions(lengths):
+    """Cumulative distance fraction at each stop boundary (0..1), from segment
+    lengths. len(result) = len(lengths) + 1."""
+    total = float(sum(lengths))
+    fracs = [0.0]
+    run = 0.0
+    for L in lengths:
+        run += L
+        fracs.append(run / total if total > 0 else 0.0)
+    return fracs
+
+
 # -----------------------------------------------------------------------------
 # Apply: set Segment.passengers
 # -----------------------------------------------------------------------------
 def apply_passenger_loading(segments, trip_rows, profile, crush_capacity=70,
-                            board_frac=0.2, alight_frac=0.2, floor_frac=0.0,
-                            hour_mode="midpoint", round_to_int=True,
-                            verbose=True):
+                            shape="beta", board_pos=0.25, alight_pos=0.75,
+                            concentration=6.0, board_frac=0.2, alight_frac=0.2,
+                            floor_frac=0.0, hour_mode="midpoint",
+                            round_to_int=True, verbose=True):
     """
-    Overwrite each Segment.passengers with a modelled on-board occupancy.
+    Overwrite each Segment.passengers with a modelled on-board occupancy:
+
+        occupancy = crush_capacity * temporal_factor(hour) * shape(position)
 
     crush_capacity : "fully packed" peak occupancy for YOUR vehicle (seated +
-                     standing). This is a vehicle property -- set it to match the
-                     BEB you simulate (a 12 m single-deck is ~70-80; a Dublin
-                     double-deck is ~90-100+). It anchors the peak-hour maximum.
-    board/alight/floor_frac : load-shape parameters (see trapezoid_shape).
+                     standing). Anchors the peak-hour, busiest-segment maximum.
+    shape          : spatial load profile along the route:
+        'beta'      -> realistic boarding/alighting curve (default; low at ends,
+                       full in the middle). Controlled by board_pos, alight_pos,
+                       concentration -- see occupancy_from_boarding_alighting.
+        'trapezoid' -> piecewise-linear ramp/plateau/ramp (board_frac/alight_frac)
+        'triangular'-> board_frac=alight_frac=0.5
+        'flat'      -> every segment at the peak level
     hour_mode      : 'midpoint' or 'start' (see trip_reference_hour).
 
     Returns the same segment list (mutated in place).
@@ -133,20 +210,36 @@ def apply_passenger_loading(segments, trip_rows, profile, crush_capacity=70,
     peak_occ = crush_capacity * tf
 
     lengths = [s.length_m for s in segments]
-    total = sum(lengths)
-    cum = 0.0
+
+    if shape in ("beta", "realistic", "boarding_alighting"):
+        stop_fracs = _stop_fractions(lengths)
+        mult = occupancy_from_boarding_alighting(
+            stop_fracs, board_pos=board_pos, alight_pos=alight_pos,
+            concentration=concentration, floor_frac=floor_frac)
+    elif shape in ("trapezoid", "triangular", "flat"):
+        if shape == "triangular":
+            board_frac = alight_frac = 0.5
+        elif shape == "flat":
+            board_frac = alight_frac = 0.0
+        total = float(sum(lengths))
+        mult, cum = [], 0.0
+        for L in lengths:
+            mid = (cum + L / 2.0) / total if total > 0 else 0.5
+            cum += L
+            mult.append(trapezoid_shape(mid, board_frac, alight_frac, floor_frac))
+    else:
+        raise ValueError(f"unknown shape {shape!r}")
+
     loads = []
-    for seg, L in zip(segments, lengths):
-        mid_frac = (cum + L / 2.0) / total if total > 0 else 0.5
-        cum += L
-        occ = peak_occ * trapezoid_shape(mid_frac, board_frac, alight_frac,
-                                         floor_frac)
+    for seg, m in zip(segments, mult):
+        occ = peak_occ * m
         seg.passengers = int(round(occ)) if round_to_int else occ
         loads.append(seg.passengers)
 
     if verbose:
         mean = sum(loads) / len(loads)
-        print(f"  loading: trip hour {hour:02d}:00, demand factor {tf:.2f} -> "
-              f"peak {peak_occ:.0f} pax (mean {mean:.0f}, max {max(loads)}) "
-              f"across {len(loads)} segments")
+        peak_at = (mult.index(max(mult)) + 0.5) / len(mult) if mult else 0.0
+        print(f"  loading: hour {hour:02d}:00, factor {tf:.2f} -> peak "
+              f"{peak_occ:.0f} pax (mean {mean:.0f}, max {max(loads)}); "
+              f"shape={shape}, busiest at ~{peak_at * 100:.0f}% of route")
     return segments
