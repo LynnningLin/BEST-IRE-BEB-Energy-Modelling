@@ -27,8 +27,8 @@ once (filtering to a Python set, never loading the whole file).
 
 USAGE
 -----
-    # passenger loading is configured in the script (DEFAULT_DEMAND_* near the
-    # top), so it applies with no flags -- just name the route(s):
+    # passenger loading and data paths are configured in configs/model.yaml,
+    # so loading applies with no flags -- just name the route(s):
     python3 gtfs_to_segments.py 220
     # every trip on a weekday, all requested routes:
     python3 gtfs_to_segments.py 102 41 --day monday
@@ -46,12 +46,20 @@ import argparse
 import csv
 import io
 import re
+import sys
 import zipfile
 from math import radians, sin, cos, asin, sqrt
 from pathlib import Path
 
 import pandas as pd
 import srtm  # SRTM elevation tiles, same source RouteZero uses for grades
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = PROJECT_ROOT / "src"
+if SRC_DIR.exists() and str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from best_ire_beb.config import get_path, get_section
 
 # Reuse the vehicle model and Segment dataclass from the sibling file.
 from beb_soc_model import Segment, VehicleParams, simulate_route
@@ -65,32 +73,6 @@ except ImportError:
     HourlyDemandProfile = None
     apply_passenger_loading = None
     _HAS_LOADING = False
-
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_GTFS = PROJECT_ROOT / "data" / "raw" / "GTFS_Realtime.zip"
-DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "processed"
-DEFAULT_SRTM_CACHE = PROJECT_ROOT / "data" / "srtm_cache"
-
-# --- Passenger-loading config (edit here, not on the command line) -----------
-# These drive passenger loading by default, so `python3 gtfs_to_segment.py 220`
-# already applies it. The matching CLI flags exist only as optional overrides.
-#
-# >>> SET THE FULL PATH TO YOUR DEMAND CSV HERE <<<
-# e.g. DEFAULT_DEMAND_CSV = "/full/path/to/bus_hourly_loading_profile_2013_2023_long.csv"
-# Leave it as "" (empty) to turn loading off and use the flat assumption.
-DEFAULT_DEMAND_CSV = "data/processed/bus_hourly_loading_profile_2013_2023_long.csv"   # <-- fill in your CSV path
-DEFAULT_DEMAND_CITY = "Cork"
-DEFAULT_CRUSH_CAPACITY = 85   # peak "fully packed" occupancy of your BEB
-
-# Spatial load shape along the route (how the bus fills and empties):
-#   'beta' = realistic boarding/alighting curve (low at ends, full in middle).
-#   board/alight_pos move the busy zone; raise alight_pos for a route that fills
-#   toward a city-centre terminus. concentration = how peaked (higher = sharper).
-DEFAULT_LOAD_SHAPE = "beta"
-DEFAULT_BOARD_POS = 0.25
-DEFAULT_ALIGHT_POS = 0.75
-DEFAULT_CONCENTRATION = 6.0
 
 WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday",
             "saturday", "sunday"]
@@ -593,18 +575,32 @@ def parse_route_list(route_args, routes_csv):
 
 
 def parse_args():
+    base = argparse.ArgumentParser(add_help=False)
+    base.add_argument("--config", help="Path to a model YAML config file.")
+    config_args, _ = base.parse_known_args()
+    config_path = config_args.config
+    gtfs_cfg = get_section("gtfs", config_path)
+    loading_cfg = get_section("passenger_loading", config_path)
+
+    default_gtfs = get_path("gtfs_zip", config_path)
+    default_output_dir = get_path("gtfs_output_dir", config_path)
+    default_srtm_cache = get_path("srtm_cache_dir", config_path)
+    default_demand_csv = get_path("passenger_loading_csv", config_path)
+
     p = argparse.ArgumentParser(
-        description="GTFS route short names -> per-trip BEB segment CSVs.")
+        description="GTFS route short names -> per-trip BEB segment CSVs.",
+        parents=[base])
     p.add_argument("route_short_names", nargs="*",
                    help="e.g. 102 41 15 (commas allowed).")
     p.add_argument("--routes", help="Comma-separated route short names.")
-    p.add_argument("--gtfs", default=str(DEFAULT_GTFS))
-    p.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
-    p.add_argument("--direction-id", type=int, default=0)
+    p.add_argument("--gtfs", default=str(default_gtfs))
+    p.add_argument("--output-dir", default=str(default_output_dir))
+    p.add_argument("--direction-id", type=int,
+                   default=int(gtfs_cfg.get("direction_id", 0)))
     p.add_argument("--any-direction", action="store_true",
                    help="Use trips from all directions.")
     # which day / service
-    p.add_argument("--day", default="monday", choices=WEEKDAYS,
+    p.add_argument("--day", default=gtfs_cfg.get("day", "monday"), choices=WEEKDAYS,
                    help="Weekday whose services to use (via calendar.txt).")
     p.add_argument("--service-id", help="Force a specific service_id.")
     p.add_argument("--all-services", action="store_true",
@@ -613,60 +609,71 @@ def parse_args():
     p.add_argument("--start-times",
                    help="Comma-separated HH:MM[:SS]; nearest trip to each is "
                         "used. Omit to process ALL trips on the service day.")
-    p.add_argument("--tolerance-min", type=int, default=15,
+    p.add_argument("--tolerance-min", type=int,
+                   default=int(gtfs_cfg.get("tolerance_min", 15)),
                    help="Max minutes between a requested and an actual start.")
     # vehicle / loading
-    p.add_argument("--passengers", type=int, default=20,
+    p.add_argument("--passengers", type=int,
+                   default=int(gtfs_cfg.get("flat_passengers", 20)),
                    help="Flat fallback load used when no demand profile is set.")
-    p.add_argument("--demand-csv", default=str(DEFAULT_DEMAND_CSV),
-                   help="Override the demand CSV set in DEFAULT_DEMAND_CSV. "
+    p.add_argument("--demand-csv", default=str(default_demand_csv or ""),
+                   help="Override the passenger_loading_csv set in the config. "
                         "Long/multi-city needs --demand-city.")
-    p.add_argument("--demand-city", default=DEFAULT_DEMAND_CITY,
-                   help="Override DEFAULT_DEMAND_CITY (e.g. Cork, Dublin, "
+    p.add_argument("--demand-city", default=loading_cfg.get("demand_city", "Cork"),
+                   help="Override passenger_loading.demand_city (e.g. Cork, Dublin, "
                         "Galway, Limerick, Waterford).")
     p.add_argument("--no-demand", action="store_true",
                    help="Ignore the demand profile; use the flat --passengers load.")
-    p.add_argument("--crush-capacity", type=int, default=DEFAULT_CRUSH_CAPACITY,
-                   help="Override DEFAULT_CRUSH_CAPACITY (peak occupancy).")
-    p.add_argument("--board-frac", type=float, default=0.2)
-    p.add_argument("--alight-frac", type=float, default=0.2)
-    p.add_argument("--floor-frac", type=float, default=0.0)
-    p.add_argument("--hour-mode", default="midpoint", choices=["midpoint", "start"])
-    p.add_argument("--load-shape", default=DEFAULT_LOAD_SHAPE,
+    p.add_argument("--crush-capacity", type=int,
+                   default=int(loading_cfg.get("crush_capacity", 70)),
+                   help="Override passenger_loading.crush_capacity.")
+    p.add_argument("--board-frac", type=float,
+                   default=float(loading_cfg.get("board_frac", 0.2)))
+    p.add_argument("--alight-frac", type=float,
+                   default=float(loading_cfg.get("alight_frac", 0.2)))
+    p.add_argument("--floor-frac", type=float,
+                   default=float(loading_cfg.get("floor_frac", 0.0)))
+    p.add_argument("--hour-mode", default=loading_cfg.get("hour_mode", "midpoint"),
+                   choices=["midpoint", "start"])
+    p.add_argument("--load-shape", default=loading_cfg.get("load_shape", "beta"),
                    choices=["beta", "trapezoid", "triangular", "flat"],
                    help="Spatial load profile along the route.")
-    p.add_argument("--board-pos", type=float, default=DEFAULT_BOARD_POS,
+    p.add_argument("--board-pos", type=float,
+                   default=float(loading_cfg.get("board_pos", 0.25)),
                    help="beta shape: where boardings concentrate (0=start,1=end).")
-    p.add_argument("--alight-pos", type=float, default=DEFAULT_ALIGHT_POS,
+    p.add_argument("--alight-pos", type=float,
+                   default=float(loading_cfg.get("alight_pos", 0.75)),
                    help="beta shape: where alightings concentrate (raise for a "
                         "route that fills toward a city-centre terminus).")
-    p.add_argument("--concentration", type=float, default=DEFAULT_CONCENTRATION,
+    p.add_argument("--concentration", type=float,
+                   default=float(loading_cfg.get("concentration", 6.0)),
                    help="beta shape: peak sharpness (higher = tighter peak).")
-    p.add_argument("--srtm-cache-dir", default=str(DEFAULT_SRTM_CACHE))
+    p.add_argument("--srtm-cache-dir", default=str(default_srtm_cache))
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
+    gtfs_cfg = get_section("gtfs", args.config)
+    loading_cfg = get_section("passenger_loading", args.config)
     route_short_names = parse_route_list(args.route_short_names, args.routes)
     if not route_short_names:
-        route_short_names = ["208"]
+        route_short_names = [str(r) for r in gtfs_cfg.get("default_routes", ["208"])]
 
     start_times = ([s.strip() for s in args.start_times.split(",") if s.strip()]
                    if args.start_times else None)
     direction_id = None if args.any_direction else args.direction_id
 
-    # Passenger loading is driven by the script config (DEFAULT_DEMAND_*),
-    # so it works with no CLI flags. --no-demand or a missing file -> flat load.
+    # Passenger loading is driven by configs/model.yaml, so it works with no CLI
+    # flags. --no-demand or a missing file -> flat load.
     demand_profile = None
-    if args.no_demand:
+    if args.no_demand or not loading_cfg.get("enabled", True):
         print(f"Passenger loading: OFF (--no-demand) -> flat "
               f"{args.passengers} pax/segment.")
     elif not args.demand_csv:
-        print(f"Passenger loading: OFF (DEFAULT_DEMAND_CSV is empty) -> flat "
+        print(f"Passenger loading: OFF (passenger_loading_csv is empty) -> flat "
               f"{args.passengers} pax/segment.")
-        print("  To enable: set DEFAULT_DEMAND_CSV at the top of this script to "
-              "your CSV path,")
+        print("  To enable: set paths.passenger_loading_csv in configs/model.yaml,")
         print("  or pass --demand-csv <path>.")
     elif args.demand_csv:
         found = find_demand_csv(args.demand_csv)
@@ -684,7 +691,7 @@ if __name__ == "__main__":
                   "(also their")
             print("         data/ and data/raw/ subfolders). Drop the CSV in one of "
                   "those, or")
-            print("         edit DEFAULT_DEMAND_CSV / pass --demand-csv <path>.")
+            print("         edit configs/model.yaml / pass --demand-csv <path>.")
             print("=" * 72)
     loading_kwargs = {"shape": args.load_shape,
                       "board_pos": args.board_pos,
@@ -697,13 +704,15 @@ if __name__ == "__main__":
 
     tables = load_small_tables(Path(args.gtfs))
     elevation_data = srtm.get_data(local_cache_dir=str(args.srtm_cache_dir))
+    vehicle_params = VehicleParams.from_config(args.config)
 
     saved = process_routes(
         Path(args.gtfs), route_short_names, Path(args.output_dir), tables=tables,
         direction_id=direction_id, day=args.day, service_id=args.service_id,
         all_services=args.all_services, start_times=start_times,
         tolerance_s=args.tolerance_min * 60, passengers=args.passengers,
-        elevation_data=elevation_data, srtm_cache_dir=args.srtm_cache_dir,
+        vehicle_params=vehicle_params, elevation_data=elevation_data,
+        srtm_cache_dir=args.srtm_cache_dir,
         demand_profile=demand_profile, crush_capacity=args.crush_capacity,
         loading_kwargs=loading_kwargs,
     )

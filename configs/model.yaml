@@ -1,0 +1,169 @@
+# Central model and workflow configuration.
+#
+# Notes:
+# - Paths are resolved relative to the project root unless they are absolute.
+# - Numeric units are included in the key name where possible.
+# - CLI flags can still override many of these defaults for one-off runs.
+
+# ## File and Directory Paths
+paths:
+  # Project data folders.
+  data_dir: data
+  raw_data_dir: data/raw
+  processed_data_dir: data/processed
+
+  # Static GTFS feed used by scripts/gtfs_to_segment.py.
+  gtfs_zip: data/raw/GTFS_Realtime.zip
+
+  # Hourly passenger-flow profile used to estimate segment occupancy.
+  # Expected long format includes city, hour, avg_hourly_flow_percent.
+  passenger_loading_csv: data/processed/bus_hourly_loading_profile_2013_2023_long.csv
+
+  # Hourly weather model input used by scripts/weather_loading.py.
+  # Expected columns include time, temp, rhum, and optionally solar.
+  weather_csv: data/processed/cork_weather_hourly_model_input_2021_2025_with_solar.csv
+
+  # Output/cache locations for generated GTFS segment files and SRTM tiles.
+  gtfs_output_dir: data/processed
+  srtm_cache_dir: data/srtm_cache
+
+  # Outputs from the synthetic example in scripts/beb_soc_model.py.
+  synthetic_segment_results_csv: data/processed/beb_segment_results.csv
+  synthetic_soc_trace_png: reports/figures/beb_soc_trace.png
+
+# ## Vehicle and Battery Parameters
+# These describe the representative BEB used by the energy model.
+vehicle:
+  # Empty bus mass including battery pack.
+  curb_mass_kg: 14000.0
+
+  # Average passenger mass added for each onboard passenger.
+  passenger_mass_kg: 70.0
+
+  # Aerodynamic frontal area and drag coefficient.
+  frontal_area_m2: 10.8
+  drag_coeff: 0.70
+
+  # Rolling resistance coefficient for tyres on road.
+  roll_coeff: 0.0085
+
+  # Rotational inertia multiplier for wheels/driveline.
+  rot_inertia_factor: 1.05
+
+  # Driveline and motor/inverter efficiencies while drawing traction power.
+  eta_driveline: 0.92
+  eta_motor: 0.90
+
+  # Share of braking energy recovered through regenerative braking.
+  regen_fraction: 0.60
+
+  # Baseline auxiliary load used by the simple vehicle model.
+  aux_power_kW: 7.0
+
+  # Usable battery capacity, not gross pack capacity.
+  battery_usable_kWh: 410.0
+
+  # Environmental/physics constants.
+  air_density: 1.225
+  g: 9.81
+
+# ## GTFS Route Processing Defaults
+gtfs:
+  # Routes used when no route is passed on the command line.
+  default_routes:
+    - "208"
+
+  # GTFS direction_id to process by default. Use --any-direction to ignore it.
+  direction_id: 0
+
+  # Service day used to select trips from calendar.txt.
+  day: monday
+
+  # Maximum gap when matching a requested start time to the nearest real trip.
+  tolerance_min: 15
+
+  # Fallback flat onboard passenger count when demand loading is disabled/missing.
+  flat_passengers: 20
+
+# ## Passenger Loading Defaults
+# These turn an hourly demand profile into per-segment onboard passengers.
+passenger_loading:
+  # City to select from the long-format passenger loading CSV.
+  demand_city: Cork
+
+  # Peak occupancy used to scale the busiest segment in the peak demand hour.
+  crush_capacity: 85
+
+  # Set false to skip demand loading and use gtfs.flat_passengers instead.
+  enabled: true
+
+  # Spatial shape along the route: beta, trapezoid, triangular, or flat.
+  load_shape: beta
+
+  # Beta shape controls. Move these to shift where the bus fills/empties.
+  board_pos: 0.25
+  alight_pos: 0.75
+
+  # Higher concentration makes boarding/alighting peaks sharper.
+  concentration: 6.0
+
+  # Trapezoid/triangular controls: fraction of route spent boarding/alighting.
+  board_frac: 0.2
+  alight_frac: 0.2
+
+  # Baseline fraction kept at the route ends instead of allowing zero load.
+  floor_frac: 0.0
+
+  # Demand hour selection for a trip: midpoint or start.
+  hour_mode: midpoint
+
+# ## Weather and HVAC Defaults
+weather:
+  # Climate-control plug: heating below heat_below_c, cooling above cool_above_c.
+  # The band between them is treated as comfort dead-band / fans only.
+  climate_control:
+    heat_below_c: 10.0
+    cool_above_c: 20.0
+
+  # HVAC assumptions used to convert weather into per-segment auxiliary load.
+  hvac:
+    # Non-thermal auxiliary load: lights, controls, doors, fans.
+    base_aux_kW: 3.0
+
+    # Lumped cabin heat-transfer coefficient: shell, glazing, ventilation, doors.
+    cabin_loss_W_per_K: 500.0
+
+    # Effective solar gain area. Set to 0 to ignore solar heating.
+    solar_aperture_m2: 6.0
+
+    # Sensible heat gain per passenger and whether to include it.
+    pax_sensible_W: 90.0
+    use_passenger_gain: true
+
+    # Heating system type: heat_pump uses the COP curve; resistive uses COP=1.
+    heater_type: heat_pump
+
+    # Heat-pump COP curve and bounds.
+    heat_cop_at_0c: 2.2
+    heat_cop_slope: 0.06
+    heat_cop_min: 1.0
+    heat_cop_max: 3.5
+
+    # Cooling COP.
+    cool_cop: 2.5
+
+    # Extra cooling fraction at RH=1.0 for latent/dehumidification load.
+    latent_load_at_full_rh: 0.30
+
+    # Clamp for HVAC-only electrical load.
+    hvac_max_kW: 30.0
+
+    # Weather model used by apply_weather_loading: thermal or piecewise.
+    model: thermal
+
+    # Weather lookup point for a trip: midpoint or start.
+    hour_mode: midpoint
+
+    # Piecewise model slopes, only used when model is piecewise.
+    k_heat_kW_per_K: 0.40
+    k_cool_kW_per_K: 0.35

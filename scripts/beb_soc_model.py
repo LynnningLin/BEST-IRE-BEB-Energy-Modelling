@@ -45,32 +45,50 @@ DEM (average grade per segment). Nothing else needs to change. Swapping syntheti
 ================================================================================
 """
 
-from dataclasses import dataclass, field
+import argparse
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")  # no display needed; we save figures to file
 import matplotlib.pyplot as plt
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = PROJECT_ROOT / "src"
+if SRC_DIR.exists() and str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from best_ire_beb.config import get_path, vehicle_params
+
 
 # ----------------------------------------------------------------------------- 
-# 1. PARAMETERS  (placeholder values for a ~12 m city BEB -- edit these)
+# 1. PARAMETERS
 # -----------------------------------------------------------------------------
+_VEHICLE_DEFAULTS = vehicle_params()
+
+
 @dataclass
 class VehicleParams:
-    curb_mass_kg: float = 14_000.0     # empty bus incl. battery (12 m BEB)
-    passenger_mass_kg: float = 70.0    # mass per passenger
-    frontal_area_m2: float = 10.8       # ~2.55 m wide x ~4.25 m high
-    drag_coeff: float = 0.70           # Cd, typical city bus
-    roll_coeff: float = 0.0085          # Crr, tyres on asphalt
-    rot_inertia_factor: float = 1.05   # lambda: accounts for rotating masses
-    eta_driveline: float = 0.92        # gearbox/axle efficiency
-    eta_motor: float = 0.90            # motor + inverter efficiency
-    regen_fraction: float = 0.60       # fraction of braking energy recovered
-    aux_power_kW: float = 7.0          # HVAC + lights + control. Raise for winter.
-    battery_usable_kWh: float = 410.0  # approx. 454-472 kWh gross pack
-    air_density: float = 1.225         # kg/m^3
-    g: float = 9.81                    # m/s^2
+    curb_mass_kg: float = _VEHICLE_DEFAULTS["curb_mass_kg"]
+    passenger_mass_kg: float = _VEHICLE_DEFAULTS["passenger_mass_kg"]
+    frontal_area_m2: float = _VEHICLE_DEFAULTS["frontal_area_m2"]
+    drag_coeff: float = _VEHICLE_DEFAULTS["drag_coeff"]
+    roll_coeff: float = _VEHICLE_DEFAULTS["roll_coeff"]
+    rot_inertia_factor: float = _VEHICLE_DEFAULTS["rot_inertia_factor"]
+    eta_driveline: float = _VEHICLE_DEFAULTS["eta_driveline"]
+    eta_motor: float = _VEHICLE_DEFAULTS["eta_motor"]
+    regen_fraction: float = _VEHICLE_DEFAULTS["regen_fraction"]
+    aux_power_kW: float = _VEHICLE_DEFAULTS["aux_power_kW"]
+    battery_usable_kWh: float = _VEHICLE_DEFAULTS["battery_usable_kWh"]
+    air_density: float = _VEHICLE_DEFAULTS["air_density"]
+    g: float = _VEHICLE_DEFAULTS["g"]
+
+    @classmethod
+    def from_config(cls, config_path=None):
+        return cls(**vehicle_params(config_path))
 
 
 @dataclass
@@ -219,8 +237,17 @@ def make_synthetic_route(n_segments=40, seed=42):
 # ----------------------------------------------------------------------------- 
 # 6. RUN
 # -----------------------------------------------------------------------------
+def parse_args():
+    p = argparse.ArgumentParser(description="Run the synthetic BEB SoC example.")
+    p.add_argument("--config", help="Path to a model YAML config file.")
+    p.add_argument("--results-csv", help="Override synthetic results CSV path.")
+    p.add_argument("--trace-png", help="Override synthetic SoC trace PNG path.")
+    return p.parse_args()
+
+
 def main():
-    p = VehicleParams()
+    args = parse_args()
+    p = VehicleParams.from_config(args.config)
     segments = make_synthetic_route()
     df = simulate_route(segments, p, soc0_pct=100.0)
 
@@ -234,7 +261,15 @@ def main():
     print(f"Average consumption   : {total_E / total_km:.3f} kWh/km")
     print(f"SoC at end of route   : {df['SoC_end_%'].iloc[-1]:.1f} %")
 
-    df.to_csv("beb_segment_results.csv", index=False)
+    results_csv = Path(args.results_csv) if args.results_csv else get_path(
+        "synthetic_segment_results_csv", args.config
+    )
+    trace_png = Path(args.trace_png) if args.trace_png else get_path(
+        "synthetic_soc_trace_png", args.config
+    )
+    results_csv.parent.mkdir(parents=True, exist_ok=True)
+    trace_png.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(results_csv, index=False)
 
     # Plot SoC and per-segment consumption against distance.
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 7), sharex=True)
@@ -250,8 +285,8 @@ def main():
     ax2.grid(True, alpha=0.3)
 
     fig.tight_layout()
-    fig.savefig("beb_soc_trace.png", dpi=130)
-    print("\nSaved: beb_segment_results.csv  and  beb_soc_trace.png")
+    fig.savefig(trace_png, dpi=130)
+    print(f"\nSaved: {results_csv}  and  {trace_png}")
 
 
 if __name__ == "__main__":
