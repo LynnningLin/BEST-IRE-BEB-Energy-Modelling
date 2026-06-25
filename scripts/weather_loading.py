@@ -419,3 +419,4 @@ if __name__ == "__main__":
         wet = hvac_kW_thermal(WeatherConditions(t, relative_humidity=0.95), 20, hp)
         print(f"    {t:+.0f} C: RH 40% -> {dry:.2f} kW | RH 95% -> {wet:.2f} kW "
               f"(delta {wet - dry:+.2f})")
+

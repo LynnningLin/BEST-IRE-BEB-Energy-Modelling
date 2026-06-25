@@ -81,6 +81,8 @@ class VehicleParams:
     eta_driveline: float = _VEHICLE_DEFAULTS["eta_driveline"]
     eta_motor: float = _VEHICLE_DEFAULTS["eta_motor"]
     regen_fraction: float = _VEHICLE_DEFAULTS["regen_fraction"]
+    regen_power_cap_kW: float = _VEHICLE_DEFAULTS["regen_power_cap_kW"]
+    regen_min_speed_ms: float = _VEHICLE_DEFAULTS["regen_min_speed_ms"]
     aux_power_kW: float = _VEHICLE_DEFAULTS["aux_power_kW"]
     battery_usable_kWh: float = _VEHICLE_DEFAULTS["battery_usable_kWh"]
     air_density: float = _VEHICLE_DEFAULTS["air_density"]
@@ -152,15 +154,24 @@ def build_speed_profile(seg: Segment, a_accel=1.0, a_decel=1.2, dt=0.5):
 # ----------------------------------------------------------------------------- 
 # 3. MOTION -> ENERGY : battery energy used over one segment
 # -----------------------------------------------------------------------------
-def segment_energy_kWh(seg: Segment, p: VehicleParams):
+def segment_energy_kWh(seg: Segment, p: VehicleParams, soc_start_pct=None):
     """Return battery energy (kWh) for one segment, including dwell aux load."""
     m = p.curb_mass_kg + seg.passengers * p.passenger_mass_kg
     theta = np.arctan(seg.grade)
-    aux_W = p.aux_power_kW * 1000.0
+    # Use the per-segment aux written by apply_weather_loading (base + HVAC) when
+    # present; otherwise fall back to the vehicle's constant aux. Without this the
+    # weather/HVAC module has no effect -- segment_energy_kWh would always read
+    # the flat p.aux_power_kW and discard seg.aux_power_kW.
+    seg_aux = getattr(seg, "aux_power_kW", None)
+    aux_kW = seg_aux if seg_aux is not None else p.aux_power_kW
+    aux_W = aux_kW * 1000.0
 
     t, v, a, dt = build_speed_profile(seg)
 
     E_joules = 0.0
+    soc_pct = None if soc_start_pct is None else min(float(soc_start_pct), 100.0)
+    drive_eff = p.eta_driveline * p.eta_motor
+    regen_power_cap_W = max(p.regen_power_cap_kW, 0.0) * 1000.0
     for vi, ai in zip(v, a):
         moving = vi > 0.01
         F_roll  = p.roll_coeff * m * p.g * np.cos(theta) * moving
@@ -173,12 +184,26 @@ def segment_energy_kWh(seg: Segment, p: VehicleParams):
 
         if P_wheel >= 0:
             # Drawing power: divide by efficiencies (losses make it cost more).
-            P_batt = P_wheel / (p.eta_driveline * p.eta_motor) + aux_W
+            P_batt = P_wheel / drive_eff + aux_W
         else:
-            # Braking: recover a fraction back into the battery (P_wheel is < 0).
-            P_batt = P_wheel * (p.eta_driveline * p.eta_motor) * p.regen_fraction + aux_W
+            regen_power_W = 0.0
+            if vi >= p.regen_min_speed_ms and (soc_pct is None or soc_pct < 100.0):
+                # Braking: recover a bounded fraction back into the battery.
+                recoverable_W = -P_wheel * drive_eff * p.regen_fraction
+                regen_power_W = min(recoverable_W, regen_power_cap_W)
+            P_batt = aux_W - regen_power_W
 
-        E_joules += P_batt * dt
+        E_step_joules = P_batt * dt
+        if soc_pct is not None and E_step_joules < 0:
+            charge_room_joules = (
+                max(100.0 - soc_pct, 0.0) / 100.0 * p.battery_usable_kWh * 3.6e6
+            )
+            E_step_joules = max(E_step_joules, -charge_room_joules)
+
+        E_joules += E_step_joules
+        if soc_pct is not None:
+            soc_pct -= E_step_joules / 3.6e6 / p.battery_usable_kWh * 100.0
+            soc_pct = min(soc_pct, 100.0)
 
     # Dwell at the stop: bus stationary, only auxiliary load draws power.
     E_joules += aux_W * seg.dwell_s
@@ -194,7 +219,7 @@ def simulate_route(segments, p: VehicleParams, soc0_pct=100.0):
     soc = soc0_pct
     cum_dist_km = 0.0
     for i, seg in enumerate(segments):
-        E = segment_energy_kWh(seg, p)
+        E = segment_energy_kWh(seg, p, soc_start_pct=soc)
         soc_before = soc
         soc -= E / p.battery_usable_kWh * 100.0
         soc = min(soc, 100.0)  # a real BMS caps charging at 100%

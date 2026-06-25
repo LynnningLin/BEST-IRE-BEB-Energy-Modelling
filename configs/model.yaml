@@ -57,6 +57,12 @@ vehicle:
   # Share of braking energy recovered through regenerative braking.
   regen_fraction: 0.60
 
+  # Maximum battery-side regenerative charging power accepted by the pack.
+  regen_power_cap_kW: 150.0
+
+  # Below this speed, braking is treated as friction-only rather than regen.
+  regen_min_speed_ms: 2.0
+
   # Baseline auxiliary load used by the simple vehicle model.
   aux_power_kW: 7.0
 

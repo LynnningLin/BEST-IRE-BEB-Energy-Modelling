@@ -39,6 +39,8 @@ _BUILTIN_DEFAULTS: dict[str, Any] = {
         "eta_driveline": 0.92,
         "eta_motor": 0.90,
         "regen_fraction": 0.60,
+        "regen_power_cap_kW": 150.0,
+        "regen_min_speed_ms": 2.0,
         "aux_power_kW": 7.0,
         "battery_usable_kWh": 410.0,
         "air_density": 1.225,
