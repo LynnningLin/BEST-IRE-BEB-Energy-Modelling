@@ -36,6 +36,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, date, time, timedelta
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 
@@ -50,6 +51,7 @@ WEATHER_CSV_PATH = get_path("weather_csv")
 _WEATHER_DEFAULTS = get_section("weather")
 _CLIMATE_DEFAULTS = _WEATHER_DEFAULTS["climate_control"]
 _HVAC_DEFAULTS = _WEATHER_DEFAULTS["hvac"]
+DEFAULT_HEATING_MONTHS = (11, 12, 1, 2, 3)
 
 
 # -----------------------------------------------------------------------------
@@ -78,13 +80,14 @@ class WeatherConditions:
     relative_humidity: float = 0.80    # 0..1 fraction                      <- CSV 'rhum'/100
     solar_W_m2: float = 0.0            # global horizontal irradiance (W/m^2)  <- CSV 'solar'
     is_raining: bool = False           # not in this CSV; hook for future Crr coupling
+    observed_at: Optional[datetime] = None
 
 
 # #############################################################################
 # ##  THE CLIMATE-CONTROL PLUG                                               ##
 # ##  Decides WHEN heating / cooling engage. Customise these two numbers.    ##
 # ##  Example from the brief: heat_below_c=10, cool_above_c=20               ##
-# ##    ambient < heat_below_c  -> HEATING on                                ##
+# ##    ambient < heat_below_c, Nov-Mar -> HEATING on                        ##
 # ##    ambient > cool_above_c  -> COOLING on                                ##
 # ##    in between              -> OFF (comfort dead-band, fans only)        ##
 # ##  Each threshold also serves as the cabin target it conditions toward,   ##
@@ -94,6 +97,7 @@ class WeatherConditions:
 class ClimateControlPlug:
     heat_below_c: float = float(_CLIMATE_DEFAULTS["heat_below_c"])
     cool_above_c: float = float(_CLIMATE_DEFAULTS["cool_above_c"])
+    heating_months: tuple = DEFAULT_HEATING_MONTHS
 
     @classmethod
     def from_config(cls, config_path=None):
@@ -101,12 +105,31 @@ class ClimateControlPlug:
         return cls(
             heat_below_c=float(cfg.get("heat_below_c", cls.heat_below_c)),
             cool_above_c=float(cfg.get("cool_above_c", cls.cool_above_c)),
+            heating_months=_normalise_months(
+                cfg.get("heating_months", DEFAULT_HEATING_MONTHS)
+            ),
         )
 
+    def heating_allowed(self, when=None) -> bool:
+        month = _month_from_when(when)
+        return month is None or month in self.heating_months
 
-def decide_mode(temp_c: float, plug: ClimateControlPlug) -> str:
+
+def _normalise_months(value) -> tuple:
+    if isinstance(value, str):
+        value = [part.strip() for part in value.split(",") if part.strip()]
+    return tuple(int(month) for month in value)
+
+
+def _month_from_when(when) -> Optional[int]:
+    if when is None:
+        return None
+    return int(when.month)
+
+
+def decide_mode(temp_c: float, plug: ClimateControlPlug, when=None) -> str:
     """Return 'heat', 'cool', or 'off' for an ambient temperature. THE PLUG."""
-    if temp_c < plug.heat_below_c:
+    if temp_c < plug.heat_below_c and plug.heating_allowed(when):
         return "heat"
     if temp_c > plug.cool_above_c:
         return "cool"
@@ -176,8 +199,9 @@ def _heating_cop(t_amb_c: float, hp: HVACParams) -> float:
 # -----------------------------------------------------------------------------
 # HVAC model 1: physical cabin heat balance (DEFAULT) -- uses temp AND humidity
 # -----------------------------------------------------------------------------
-def hvac_kW_thermal(weather: WeatherConditions, passengers: int, hp: HVACParams) -> float:
-    mode = decide_mode(weather.air_temp_c, hp.plug)
+def hvac_kW_thermal(weather: WeatherConditions, passengers: int, hp: HVACParams,
+                    when=None) -> float:
+    mode = decide_mode(weather.air_temp_c, hp.plug, when or weather.observed_at)
     if mode == "off":
         return 0.0
 
@@ -207,8 +231,9 @@ def hvac_kW_thermal(weather: WeatherConditions, passengers: int, hp: HVACParams)
 # -----------------------------------------------------------------------------
 def hvac_kW_piecewise(weather: WeatherConditions, hp: HVACParams,
                       k_heat_kW_per_K: float = 0.40,
-                      k_cool_kW_per_K: float = 0.35) -> float:
-    mode = decide_mode(weather.air_temp_c, hp.plug)
+                      k_cool_kW_per_K: float = 0.35,
+                      when=None) -> float:
+    mode = decide_mode(weather.air_temp_c, hp.plug, when or weather.observed_at)
     if mode == "heat":
         p = k_heat_kW_per_K * (hp.plug.heat_below_c - weather.air_temp_c)
     elif mode == "cool":
@@ -248,14 +273,18 @@ class WeatherSeries:
         rh = float(row["rh"]) if "rh" in self.df.columns and pd.notna(row.get("rh")) else 0.80
         solar = float(row["solar"]) if "solar" in self.df.columns and pd.notna(row.get("solar")) else 0.0
         return WeatherConditions(air_temp_c=float(row["temp"]), relative_humidity=rh,
-                                 solar_W_m2=max(solar, 0.0))
+                                 solar_W_m2=max(solar, 0.0),
+                                 observed_at=ts.to_pydatetime())
 
-    def weather_for_trip(self, service_date: date, trip_rows, mode="midpoint") -> WeatherConditions:
+    def trip_datetime(self, service_date: date, trip_rows, mode="midpoint") -> datetime:
         t0 = _time_to_seconds(trip_rows[0]["departure_time"])
         t1 = _time_to_seconds(trip_rows[-1]["arrival_time"])
         sec = t0 if mode == "start" else (t0 + t1) // 2
         base = datetime.combine(service_date, time(0, 0))
-        return self.at(base + timedelta(seconds=sec))
+        return base + timedelta(seconds=sec)
+
+    def weather_for_trip(self, service_date: date, trip_rows, mode="midpoint") -> WeatherConditions:
+        return self.at(self.trip_datetime(service_date, trip_rows, mode))
 
     # -- design days / diagnostics ------------------------------------------
     def daily_mean_temp(self) -> pd.Series:
@@ -268,7 +297,9 @@ class WeatherSeries:
 
     def mode_breakdown(self, plug: ClimateControlPlug) -> dict:
         """Fraction of hours the plug puts in heat / cool / off (sanity check)."""
-        m = self.df["temp"].apply(lambda t: decide_mode(t, plug))
+        m = pd.Series(
+            [decide_mode(row["temp"], plug, idx) for idx, row in self.df.iterrows()]
+        )
         frac = m.value_counts(normalize=True)
         return {k: round(100 * float(frac.get(k, 0.0)), 1) for k in ("heat", "cool", "off")}
 
@@ -358,23 +389,29 @@ def apply_weather_loading(segments, trip_rows, weather, hp: HVACParams = None,
     if isinstance(weather, WeatherSeries):
         if service_date is None:
             raise ValueError("service_date is required when weather is a WeatherSeries")
-        wx = weather.weather_for_trip(service_date, trip_rows, hour_mode)
+        weather_time = weather.trip_datetime(service_date, trip_rows, hour_mode)
+        wx = weather.at(weather_time)
     else:
         wx = weather
+        weather_time = getattr(wx, "observed_at", None)
+        if weather_time is None and service_date is not None:
+            weather_time = datetime.combine(service_date, time(0, 0))
 
     aux_list = []
     for seg in segments:
         if model == "thermal":
-            hvac = hvac_kW_thermal(wx, getattr(seg, "passengers", 0), hp)
+            hvac = hvac_kW_thermal(wx, getattr(seg, "passengers", 0), hp,
+                                   when=weather_time)
         elif model == "piecewise":
-            hvac = hvac_kW_piecewise(wx, hp, k_heat_kW_per_K, k_cool_kW_per_K)
+            hvac = hvac_kW_piecewise(wx, hp, k_heat_kW_per_K, k_cool_kW_per_K,
+                                     when=weather_time)
         else:
             raise ValueError(f"unknown model {model!r}")
         seg.aux_power_kW = hp.base_aux_kW + hvac
         aux_list.append(seg.aux_power_kW)
 
     if verbose:
-        mode = decide_mode(wx.air_temp_c, hp.plug)
+        mode = decide_mode(wx.air_temp_c, hp.plug, weather_time)
         mean_aux = sum(aux_list) / len(aux_list)
         when = f" on {service_date}" if service_date else ""
         print(f"  weather{when}: {wx.air_temp_c:+.1f} C, RH {wx.relative_humidity*100:.0f}% "
@@ -387,6 +424,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Exercise the weather/HVAC loader.")
     p.add_argument("--config", help="Path to a model YAML config file.")
     p.add_argument("--weather-csv", help="Override paths.weather_csv.")
+    p.add_argument("--date", help="Override simulation.date (YYYY-MM-DD).")
     return p.parse_args()
 
 
@@ -395,22 +433,30 @@ if __name__ == "__main__":
     args = parse_args()
     plug = ClimateControlPlug.from_config(args.config)
     hp = HVACParams.from_config(args.config, plug=plug)
+    simulation_cfg = get_section("simulation", args.config)
+    scenario_date = date.fromisoformat(args.date or str(simulation_cfg["date"]))
 
     series = load_weather_csv(args.weather_csv, config_path=args.config)
     print(
-        f"  plug (heat<{plug.heat_below_c:g} / cool>{plug.cool_above_c:g}) "
+        f"  plug (heat<{plug.heat_below_c:g} in months {plug.heating_months} / "
+        f"cool>{plug.cool_above_c:g}) "
         f"hour split: {series.mode_breakdown(plug)}"
     )
     cold, med, hot = series.design_days()
     print(f"  design days -> cold {cold}, median {med}, hot {hot}")
 
     trip_rows = [{"departure_time": "08:00:00", "arrival_time": "08:45:00"}]
+    wx = series.weather_for_trip(scenario_date, trip_rows)
+    kw = hvac_kW_thermal(wx, passengers=20, hp=hp)
+    print(f"  scenario {scenario_date} 08:00 -> {wx.air_temp_c:+.1f} C, "
+          f"RH {wx.relative_humidity*100:.0f}%  =>  HVAC {kw:.1f} kW "
+          f"({decide_mode(wx.air_temp_c, plug, wx.observed_at)})")
     for label, d in [("cold", cold), ("median", med), ("hot", hot)]:
         wx = series.weather_for_trip(d, trip_rows)
         kw = hvac_kW_thermal(wx, passengers=20, hp=hp)
         print(f"  {label:6s} {d} 08:00 -> {wx.air_temp_c:+.1f} C, "
               f"RH {wx.relative_humidity*100:.0f}%  =>  HVAC {kw:.1f} kW "
-              f"({decide_mode(wx.air_temp_c, plug)})")
+              f"({decide_mode(wx.air_temp_c, plug, wx.observed_at)})")
 
     # humidity effect, holding temperature fixed (only bites when cooling is ON)
     print("\n  humidity effect at fixed temperature (thermal model, 20 pax):")

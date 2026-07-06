@@ -5,6 +5,14 @@
 # - Numeric units are included in the key name where possible.
 # - CLI flags can still override many of these defaults for one-off runs.
 
+# ## Simulation Scenario
+simulation:
+  # Date used for weather lookup. GTFS service selection uses this exact date
+  # when it falls inside the GTFS feed calendar, otherwise it uses the same
+  # weekday pattern from calendar.txt.
+  # YYYY-MM-DD format.
+  date: 2025-07-09
+
 # ## File and Directory Paths
 paths:
   # Project data folders.
@@ -30,6 +38,9 @@ paths:
   # Outputs from the synthetic example in scripts/beb_soc_model.py.
   synthetic_segment_results_csv: data/processed/beb_segment_results.csv
   synthetic_soc_trace_png: reports/figures/beb_soc_trace.png
+
+  # traffic_signals_csv is used by the energy model to estimate stop-and-go losses.
+  traffic_signals_csv: data/processed/traffic_signals.csv
 
 # ## Vehicle and Battery Parameters
 # These describe the representative BEB used by the energy model.
@@ -79,10 +90,16 @@ gtfs:
   default_routes:
     - "208"
 
+  # block = chain trips by service_id + block_id and carry SoC across the duty.
+  # trip = simulate each trip independently from a full battery.
+  simulation_level: block
+
   # GTFS direction_id to process by default. Use --any-direction to ignore it.
+  # Block-level duty simulation always uses all directions so duties are complete.
   direction_id: 0
 
-  # Service day used to select trips from calendar.txt.
+  # Fallback service weekday used when simulation.date is omitted.
+  # If simulation.date is set, its weekday is used instead.
   day: monday
 
   # Maximum gap when matching a requested start time to the nearest real trip.
@@ -123,13 +140,38 @@ passenger_loading:
   # Demand hour selection for a trip: midpoint or start.
   hour_mode: midpoint
 
+# ## Traffic Signal Defaults
+traffic_signals:
+  # Set false to skip traffic-signal stop-go loading.
+  enabled: true
+
+  # Max distance for a signal to count on a stop pair.
+  snap_radius_m: 30.0
+
+  # Merge nearby OSM signal nodes so one junction is not over-counted.
+  cluster_radius_m: 35.0
+
+  relaxed_snap_radius_m: 60.0
+
+  # Signals/km assumed when OSM is unavailable.
+  fallback_per_km: 2.0
+
+  # Set true to ignore cached signal counts and re-fetch from OSM.
+  refresh: false
+
 # ## Weather and HVAC Defaults
 weather:
+  # Set false to skip historical weather/HVAC loading and use vehicle.aux_power_kW.
+  enabled: true
+
   # Climate-control plug: heating below heat_below_c, cooling above cool_above_c.
+  # Heating is only allowed in heating_months (Nov-Mar by default); cold days
+  # outside this set remain in the comfort dead-band instead of heating.
   # The band between them is treated as comfort dead-band / fans only.
   climate_control:
-    heat_below_c: 10.0
-    cool_above_c: 20.0
+    heat_below_c: 18.0
+    cool_above_c: 26.0
+    heating_months: [11, 12, 1, 2, 3]
 
   # HVAC assumptions used to convert weather into per-segment auxiliary load.
   hvac:

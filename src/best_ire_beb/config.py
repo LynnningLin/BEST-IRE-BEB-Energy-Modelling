@@ -26,8 +26,12 @@ _BUILTIN_DEFAULTS: dict[str, Any] = {
         "weather_csv": "data/processed/cork_weather_hourly_model_input_2021_2025.csv",
         "gtfs_output_dir": "data/processed",
         "srtm_cache_dir": "data/srtm_cache",
+        "traffic_signals_csv": "data/processed/traffic_signals.csv",
         "synthetic_segment_results_csv": "data/processed/beb_segment_results.csv",
         "synthetic_soc_trace_png": "reports/figures/beb_soc_trace.png",
+    },
+    "simulation": {
+        "date": "2025-01-06",
     },
     "vehicle": {
         "curb_mass_kg": 14_000.0,
@@ -48,6 +52,7 @@ _BUILTIN_DEFAULTS: dict[str, Any] = {
     },
     "gtfs": {
         "default_routes": ["208"],
+        "simulation_level": "block",
         "direction_id": 0,
         "day": "monday",
         "tolerance_min": 15,
@@ -67,9 +72,11 @@ _BUILTIN_DEFAULTS: dict[str, Any] = {
         "hour_mode": "midpoint",
     },
     "weather": {
+        "enabled": True,
         "climate_control": {
             "heat_below_c": 10.0,
             "cool_above_c": 20.0,
+            "heating_months": [11, 12, 1, 2, 3],
         },
         "hvac": {
             "base_aux_kW": 3.0,
@@ -90,6 +97,13 @@ _BUILTIN_DEFAULTS: dict[str, Any] = {
             "k_heat_kW_per_K": 0.40,
             "k_cool_kW_per_K": 0.35,
         },
+    },
+    "traffic_signals": {
+        "enabled": True,
+        "snap_radius_m": 30.0,
+        "cluster_radius_m": 35.0,
+        "fallback_per_km": 2.0,
+        "refresh": False,
     },
 }
 
