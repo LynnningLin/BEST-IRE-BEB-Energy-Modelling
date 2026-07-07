@@ -54,6 +54,21 @@ black --check src tests
 ruff check src tests
 ```
 
+## Configuration
+
+Project defaults live in `configs/model.yaml`. This file now owns the shared
+model settings, including BEB vehicle and battery parameters, GTFS input paths,
+passenger-loading data paths, weather data paths, climate-control/HVAC settings,
+SRTM cache location, and output paths.
+
+Paths in the YAML file are resolved relative to the project root unless they
+are absolute. You can point scripts at a different config with `--config`:
+
+```bash
+python scripts/gtfs_to_segment.py 208 --config configs/model.yaml
+python scripts/beb_soc_model.py --config configs/model.yaml
+```
+
 ## Notes
 
 - Put original datasets in `data/raw/`.
