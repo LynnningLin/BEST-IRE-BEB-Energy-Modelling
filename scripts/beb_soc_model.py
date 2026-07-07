@@ -133,9 +133,38 @@ class SegmentEnergy:
 # internal part of that scheduled time, not as extra time added on top. Otherwise
 # the signal mode mainly increases auxiliary/HVAC energy rather than traction.
 DEFAULT_STOP_PROB = 0.5       # probability that one signal forces a full stop
-DEFAULT_RED_WAIT_S = 20.0     # seconds of idle wait per actual signal stop
+DEFAULT_RED_WAIT_S = 15.0     # seconds of idle wait per actual signal stop
 DEFAULT_SIGNAL_TIME_POLICY = "preserve_schedule"  # or "add_delay"
 DEFAULT_MAX_SIGNAL_WAIT_SHARE = 0.35              # cap idle share of run_time_s
+
+# Time-varying activation probability for mostly pedestrian-actuated signals.
+# This is a modelling assumption. Calibrate or sensitivity-test later.
+DEFAULT_STOP_PROB_BY_HOUR = {
+    0: 0.03,
+    1: 0.03,
+    2: 0.02,
+    3: 0.02,
+    4: 0.02,
+    5: 0.04,
+    6: 0.08,
+    7: 0.14,
+    8: 0.18,
+    9: 0.22,
+    10: 0.28,
+    11: 0.32,
+    12: 0.35,
+    13: 0.35,
+    14: 0.34,
+    15: 0.32,
+    16: 0.28,
+    17: 0.25,
+    18: 0.20,
+    19: 0.15,
+    20: 0.11,
+    21: 0.08,
+    22: 0.05,
+    23: 0.04,
+}
 
 
 def _sample_profile(t_acc, t_cruise, t_dec, v_peak, a_eff, d_eff, dt):
@@ -264,6 +293,53 @@ def _stable_uniform01(*parts) -> float:
     digest = hashlib.blake2s(key.encode("utf-8"), digest_size=8).digest()
     return int.from_bytes(digest, "big") / float(1 << 64)
 
+def _hour_from_gtfs_time(value):
+    """
+    Extract clock hour from a GTFS time string.
+
+    GTFS times may exceed 24:00:00 for after-midnight trips.
+    We use modulo 24 so 25:15:00 becomes hour 1.
+    """
+    if value in (None, ""):
+        return None
+
+    try:
+        hour = int(str(value).strip().split(":")[0])
+        return hour % 24
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def _clamp_probability(value, default=0.0):
+    """Return a valid probability in [0, 1]."""
+    try:
+        p = float(value)
+    except (TypeError, ValueError):
+        p = float(default)
+    return max(0.0, min(p, 1.0))
+
+
+def _signal_stop_prob_for_segment(seg, default_prob, stop_prob_by_hour=None):
+    """
+    Return the stop probability used for this segment.
+
+    If stop_prob_by_hour is provided, the segment's from_stop_departure_time
+    is used to select an hourly probability. If the time is missing, or the
+    hour is not in the dictionary, the model falls back to default_prob.
+    """
+    hour = _hour_from_gtfs_time(
+        getattr(seg, "from_stop_departure_time", None)
+    )
+
+    if stop_prob_by_hour and hour is not None and hour in stop_prob_by_hour:
+        prob = stop_prob_by_hour[hour]
+        source = "hourly"
+    else:
+        prob = default_prob
+        source = "constant_fallback"
+
+    return _clamp_probability(prob, default_prob), hour, source
+
 
 def _signal_stop_count(seg: Segment, n_signals: int, stop_prob: float) -> int:
     """
@@ -334,6 +410,7 @@ def build_speed_profile(seg: Segment, a_accel=1.0, a_decel=1.2, dt=0.5,
                         stop_prob=DEFAULT_STOP_PROB, red_wait_s=DEFAULT_RED_WAIT_S,
                         signal_time_policy=DEFAULT_SIGNAL_TIME_POLICY,
                         max_signal_wait_share=DEFAULT_MAX_SIGNAL_WAIT_SHARE,
+                        stop_prob_by_hour=None,
                         return_diagnostics=False):
     """
     Return arrays (t, v, a, step_s) for the segment motion profile.
@@ -351,13 +428,28 @@ def build_speed_profile(seg: Segment, a_accel=1.0, a_decel=1.2, dt=0.5,
     run_time_s = getattr(seg, "run_time_s", None)
     scheduled = float(run_time_s) if run_time_s is not None and run_time_s > 0 else None
     n_signals = max(int(getattr(seg, "n_signals", 0) or 0), 0)
-    n_stops = _signal_stop_count(seg, n_signals, stop_prob)
+
+    # Use the default hourly profile unless an explicit mapping is supplied.
+    # To force the old constant-probability behaviour, call build_speed_profile(..., stop_prob_by_hour={})
+    if stop_prob_by_hour is None:
+        stop_prob_by_hour = DEFAULT_STOP_PROB_BY_HOUR
+
+    effective_stop_prob, signal_hour, signal_prob_source = _signal_stop_prob_for_segment(
+        seg,
+        default_prob=stop_prob,
+        stop_prob_by_hour=stop_prob_by_hour,
+    )
+
+    n_stops = _signal_stop_count(seg, n_signals, effective_stop_prob)
     policy = str(signal_time_policy or "preserve_schedule")
 
     diag = {
         "n_signals": n_signals,
         "n_effective_signal_stops": n_stops,
-        "signal_stop_prob": float(stop_prob),
+        "signal_hour": signal_hour,
+        "signal_stop_prob": float(effective_stop_prob),
+        "signal_stop_prob_default": float(stop_prob),
+        "signal_stop_prob_source": signal_prob_source,
         "red_wait_s_assumed": float(red_wait_s),
         "signal_time_policy": policy,
         "scheduled_run_time_s": scheduled,
@@ -587,8 +679,16 @@ def simulate_route(segments, p: VehicleParams, soc0_pct=100.0):
             "length_m": round(seg.length_m, 1),
             "grade_%": round(seg.grade * 100, 2),
             "passengers": seg.passengers,
-            "n_signals": getattr(seg, "n_signals", 0),
-            "signal_source": getattr(seg, "signal_source", None),
+            "signal_hour": (energy.motion_diagnostics or {}).get("signal_hour"),
+            "signal_stop_prob": round((energy.motion_diagnostics or {}).get(
+                "signal_stop_prob", 0.0
+            ), 3),
+            "signal_stop_prob_default": round((energy.motion_diagnostics or {}).get(
+                "signal_stop_prob_default", 0.0
+            ), 3),
+            "signal_stop_prob_source": (energy.motion_diagnostics or {}).get(
+                "signal_stop_prob_source"
+            ),
             "n_effective_signal_stops": int((energy.motion_diagnostics or {}).get(
                 "n_effective_signal_stops", 0
             )),
