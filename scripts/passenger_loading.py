@@ -50,6 +50,10 @@ class HourlyDemandProfile:
     @classmethod
     def from_percent(cls, mapping):
         """mapping: {hour:int -> percent:float}, e.g. {7:6.2, 8:8.9, 16:8.95}."""
+        negatives = {h: v for h, v in mapping.items() if float(v) < 0.0}
+        if negatives:
+            bad_hours = ", ".join(str(h) for h in sorted(negatives))
+            raise ValueError(f"hourly profile has negative demand at hour(s): {bad_hours}")
         total = float(sum(mapping.values()))
         if total <= 0:
             raise ValueError("hourly profile sums to zero")

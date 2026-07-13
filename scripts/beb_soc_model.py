@@ -65,6 +65,11 @@ if SRC_DIR.exists() and str(SRC_DIR) not in sys.path:
 
 from best_ire_beb.config import get_path, vehicle_params
 
+try:  # motion_params() ships with the speed-cap refactor of config.py
+    from best_ire_beb.config import motion_params as _motion_params_cfg
+except ImportError:  # older config.py: fall back to dataclass defaults
+    _motion_params_cfg = None
+
 
 # ----------------------------------------------------------------------------- 
 # 1. PARAMETERS
@@ -109,6 +114,12 @@ class Segment:
     to_stop_departure_time: Optional[str] = None
     n_signals: int = 0       # OSM traffic signals on this segment (traffic_signals.py)
     signal_source: Optional[str] = None  # "osm" | "fallback" | "none"
+    # Independent PHYSICAL speed cap (speed_caps.py, OSM maxspeed). This is
+    # deliberately separate from v_cruise_ms: v_cruise_ms is a GTFS-derived
+    # *target* that shapes the free-flow profile, while speed_cap_ms bounds what
+    # the vehicle may physically/legally do. None -> MotionParams default cap.
+    speed_cap_ms: Optional[float] = None
+    speed_cap_source: Optional[str] = None  # "osm" | "imputed" | "fallback" | None
 
 
 @dataclass
@@ -165,6 +176,94 @@ DEFAULT_STOP_PROB_BY_HOUR = {
     22: 0.05,
     23: 0.04,
 }
+
+# Defaults come from configs/model.yaml (motion:) when the accessor exists,
+# mirroring how VehicleParams seeds from vehicle_params(). The .get() fallbacks
+# keep the module importable against an older config.py / yaml without the
+# motion section.
+_MOTION_DEFAULTS = _motion_params_cfg() if _motion_params_cfg is not None else {}
+
+
+def _coerce_hour_table(mapping):
+    """Coerce a {hour: prob} mapping to int keys / float values; None -> None."""
+    if mapping in (None, {}, ""):
+        return None if mapping is None else {}
+    return {int(h): float(p) for h, p in dict(mapping).items()}
+
+
+@dataclass
+class MotionParams:
+    """
+    Everything build_speed_profile() needs, config-driven.
+
+    The three-speed separation this refactor introduces:
+      * scheduled average speed : length_m / run_time_s (GTFS data, never a limit)
+      * target cruise speed     : Segment.v_cruise_ms (GTFS-derived, shapes the
+                                  free-flow profile; clamped by the cap)
+      * physical speed cap      : Segment.speed_cap_ms (OSM maxspeed) if set,
+                                  else default_speed_cap_ms. The ONLY quantity
+                                  feasibility is checked against.
+    """
+    accel_ms2: float = float(_MOTION_DEFAULTS.get("accel_ms2", 1.0))
+    decel_ms2: float = float(_MOTION_DEFAULTS.get("decel_ms2", 1.2))
+    dt_s: float = float(_MOTION_DEFAULTS.get("dt_s", 0.5))
+    default_speed_cap_ms: float = float(
+        _MOTION_DEFAULTS.get("default_speed_cap_ms", 13.9))
+    max_speed_cap_ms: float = float(
+        _MOTION_DEFAULTS.get("max_speed_cap_ms", 25.0))
+    stop_prob: float = float(_MOTION_DEFAULTS.get("stop_prob", DEFAULT_STOP_PROB))
+    red_wait_s: float = float(
+        _MOTION_DEFAULTS.get("red_wait_s", DEFAULT_RED_WAIT_S))
+    signal_time_policy: str = str(
+        _MOTION_DEFAULTS.get("signal_time_policy", DEFAULT_SIGNAL_TIME_POLICY))
+    max_signal_wait_share: float = float(
+        _MOTION_DEFAULTS.get("max_signal_wait_share",
+                             DEFAULT_MAX_SIGNAL_WAIT_SHARE))
+    use_hourly_signal_stop_probability: bool = bool(
+        _MOTION_DEFAULTS.get("use_hourly_signal_stop_probability", True))
+    # None -> DEFAULT_STOP_PROB_BY_HOUR; {} -> constant stop_prob only.
+    stop_prob_by_hour: Optional[dict] = None
+
+    def __post_init__(self):
+        if self.accel_ms2 <= 0 or self.decel_ms2 <= 0 or self.dt_s <= 0:
+            raise ValueError("accel_ms2, decel_ms2 and dt_s must be positive.")
+        if self.default_speed_cap_ms <= 0 or self.max_speed_cap_ms <= 0:
+            raise ValueError("speed caps must be positive.")
+        self.stop_prob_by_hour = _coerce_hour_table(self.stop_prob_by_hour)
+        if self.stop_prob_by_hour is None:
+            table = _MOTION_DEFAULTS.get("stop_prob_by_hour")
+            self.stop_prob_by_hour = _coerce_hour_table(table)
+
+    @classmethod
+    def from_config(cls, config_path=None):
+        """Build from configs/model.yaml (motion: section)."""
+        if _motion_params_cfg is None:
+            return cls()
+        cfg = dict(_motion_params_cfg(config_path))
+        known = {f for f in cls.__dataclass_fields__}
+        return cls(**{k: v for k, v in cfg.items() if k in known and v is not None})
+
+    def resolve_cap(self, seg) -> tuple:
+        """
+        (speed_cap_ms, source) for a segment: the per-segment OSM cap when
+        present, else the config default; always clamped to max_speed_cap_ms.
+        """
+        seg_cap = getattr(seg, "speed_cap_ms", None)
+        if seg_cap is not None and float(seg_cap) > 0:
+            cap = min(float(seg_cap), self.max_speed_cap_ms)
+            source = getattr(seg, "speed_cap_source", None) or "segment"
+        else:
+            cap = min(self.default_speed_cap_ms, self.max_speed_cap_ms)
+            source = "config_default"
+        return max(cap, 1e-6), source
+
+    def hour_table_or_none(self):
+        """Table for _signal_stop_prob_for_segment; {} disables hourly lookup."""
+        if not self.use_hourly_signal_stop_probability:
+            return {}
+        if self.stop_prob_by_hour is not None:
+            return self.stop_prob_by_hour
+        return DEFAULT_STOP_PROB_BY_HOUR
 
 
 def _sample_profile(t_acc, t_cruise, t_dec, v_peak, a_eff, d_eff, dt):
@@ -233,58 +332,63 @@ def _profile_duration(profile):
     return float(np.sum(profile[3]))
 
 
-def _single_segment_profile(length_m, run_time_s, v_cruise_ms,
+def _single_segment_profile(length_m, run_time_s, v_target_ms,
                             a_accel=1.0, a_decel=1.2, dt=0.5, v_cap=None):
     """
     One accelerate -> (cruise) -> decelerate-to-stop profile over length_m.
 
-    If run_time_s is feasible, the profile duration equals run_time_s. If a
-    speed cap is supplied and the requested time is physically infeasible, the
-    fastest feasible capped profile is returned instead. The caller records the
-    resulting delay in diagnostics.
+    Roles of the two speeds (this separation is the point of the refactor):
+      v_target_ms : GTFS-derived target cruise speed. Shapes the FREE-FLOW
+                    profile only (no scheduled time). Never a feasibility limit.
+      v_cap       : independent PHYSICAL speed cap (OSM maxspeed or config
+                    default). The only quantity feasibility is checked against.
+
+    Behaviour with a scheduled run_time_s:
+      * feasible under the cap  -> profile duration == run_time_s exactly, at
+        the configured accel/decel, with the minimal peak speed that fits.
+      * infeasible under the cap -> the fastest feasible capped profile is
+        returned instead (the caller logs the excess as schedule delay). The
+        model NEVER inflates acceleration/deceleration or exceeds the cap to
+        force-fit an impossible schedule -- the old "legacy fallback" that
+        scaled a_eff/d_eff up is intentionally gone.
     """
     if a_accel <= 0 or a_decel <= 0 or dt <= 0:
         raise ValueError("a_accel, a_decel, and dt must be positive.")
 
-    v_limit = v_cruise_ms if v_cap is None else min(float(v_cruise_ms), float(v_cap))
-    v_limit = max(float(v_limit), 1e-6)
+    v_target = max(float(v_target_ms), 1e-6)
+    if v_cap is not None:
+        v_cap = max(float(v_cap), 1e-6)
+    # Free-flow cruise: aim for the target, but never above the physical cap.
+    v_free = v_target if v_cap is None else min(v_target, v_cap)
+    # Feasibility limit: the physical cap. Without one (legacy direct calls),
+    # the target is the only bound available.
+    v_limit = v_cap if v_cap is not None else v_target
 
     if run_time_s is not None and run_time_s > 0:
         total_t = float(run_time_s)
         min_t = _freeflow_duration(length_m, v_limit, a_accel, a_decel)
 
-        # With a cap, never invent speeds/accelerations that are faster than the
-        # feasible minimum. Return the minimum-time profile and let diagnostics
-        # record schedule delay.
-        if v_cap is not None and total_t < min_t - 1e-9:
+        # Schedule impossible under the cap and configured dynamics: return the
+        # fastest feasible capped profile; diagnostics record the delay.
+        if total_t < min_t - 1e-9:
             return _freeflow_profile(length_m, v_limit, a_accel, a_decel, dt)
 
+        # Fit the schedule exactly: minimal peak speed covering length_m in
+        # total_t at the configured accel/decel (smaller quadratic root).
         inv_accel_sum = (1.0 / a_accel) + (1.0 / a_decel)
-        triangular_t = np.sqrt(2.0 * length_m * inv_accel_sum)
-        if total_t >= triangular_t:
-            curve = 0.5 * inv_accel_sum
-            disc = max(total_t**2 - 4.0 * curve * length_m, 0.0)
-            v_peak = (total_t - np.sqrt(disc)) / (2.0 * curve)
-            a_eff, d_eff = a_accel, a_decel
-            t_acc = v_peak / a_eff
-            t_dec = v_peak / d_eff
-            t_cruise = max(total_t - t_acc - t_dec, 0.0)
-        else:
-            # Legacy fallback when no speed cap is enforced: this compresses the
-            # profile by using higher effective acceleration/deceleration.
-            scale = 2.0 * length_m * inv_accel_sum / total_t**2
-            a_eff = a_accel * scale
-            d_eff = a_decel * scale
-            v_peak = 2.0 * length_m / total_t
-            t_acc = v_peak / a_eff
-            t_dec = v_peak / d_eff
-            t_cruise = 0.0
-
-        if v_cap is not None and v_peak > v_limit + 1e-9:
+        curve = 0.5 * inv_accel_sum
+        disc = max(total_t**2 - 4.0 * curve * length_m, 0.0)
+        v_peak = (total_t - np.sqrt(disc)) / (2.0 * curve)
+        if v_peak > v_limit + 1e-9:
+            # Numerically possible only at the feasibility boundary.
             return _freeflow_profile(length_m, v_limit, a_accel, a_decel, dt)
-        return _sample_profile(t_acc, t_cruise, t_dec, v_peak, a_eff, d_eff, dt)
+        t_acc = v_peak / a_accel
+        t_dec = v_peak / a_decel
+        t_cruise = max(total_t - t_acc - t_dec, 0.0)
+        return _sample_profile(t_acc, t_cruise, t_dec, v_peak,
+                               a_accel, a_decel, dt)
 
-    return _freeflow_profile(length_m, v_limit, a_accel, a_decel, dt)
+    return _freeflow_profile(length_m, v_free, a_accel, a_decel, dt)
 
 
 def _stable_uniform01(*parts) -> float:
@@ -406,22 +510,44 @@ def _concat_profile_parts(parts):
     return np.concatenate(ts), np.concatenate(vs), np.concatenate(as_), np.concatenate(ss)
 
 
-def build_speed_profile(seg: Segment, a_accel=1.0, a_decel=1.2, dt=0.5,
-                        stop_prob=DEFAULT_STOP_PROB, red_wait_s=DEFAULT_RED_WAIT_S,
-                        signal_time_policy=DEFAULT_SIGNAL_TIME_POLICY,
-                        max_signal_wait_share=DEFAULT_MAX_SIGNAL_WAIT_SHARE,
+def build_speed_profile(seg: Segment, a_accel=None, a_decel=None, dt=None,
+                        stop_prob=None, red_wait_s=None,
+                        signal_time_policy=None,
+                        max_signal_wait_share=None,
                         stop_prob_by_hour=None,
+                        motion_params: Optional[MotionParams] = None,
                         return_diagnostics=False):
     """
     Return arrays (t, v, a, step_s) for the segment motion profile.
 
+    Parameters come from `motion_params` (config-driven); the individual keyword
+    arguments remain as one-off overrides on top of it, so existing call sites
+    keep working. Three speeds are kept strictly separate:
+      * scheduled average speed : seg.length_m / seg.run_time_s (GTFS data)
+      * target cruise speed     : seg.v_cruise_ms, clamped by the cap; shapes
+                                  the free-flow profile only
+      * physical speed cap      : seg.speed_cap_ms (OSM maxspeed) or the config
+                                  default -- the ONLY feasibility limit, applied
+                                  to signal AND no-signal segments alike.
+
     With traffic signals, the segment is split into extra stop-start sub-links.
     In preserve_schedule mode, GTFS run_time_s remains the target total duration.
-    Red-light waiting is treated as internal schedule slack. If the assumed wait
-    would make the capped profile infeasible, the model reduces the *modelled*
-    signal wait first, instead of adding an extra auxiliary-only idle block on
-    top of the GTFS time. Only truly infeasible capped profiles create delay.
+    Red-light waiting is treated as internal schedule slack (GTFS times already
+    include average junction delay). If the assumed wait cannot fit under the
+    cap, the *modelled* wait is reduced first; only schedules that are
+    physically impossible under the cap create schedule_delay_s.
     """
+    mp = motion_params if motion_params is not None else MotionParams()
+    a_accel = mp.accel_ms2 if a_accel is None else float(a_accel)
+    a_decel = mp.decel_ms2 if a_decel is None else float(a_decel)
+    dt = mp.dt_s if dt is None else float(dt)
+    stop_prob = mp.stop_prob if stop_prob is None else float(stop_prob)
+    red_wait_s = mp.red_wait_s if red_wait_s is None else float(red_wait_s)
+    signal_time_policy = (mp.signal_time_policy if signal_time_policy is None
+                          else signal_time_policy)
+    max_signal_wait_share = (mp.max_signal_wait_share
+                             if max_signal_wait_share is None
+                             else float(max_signal_wait_share))
     if a_accel <= 0 or a_decel <= 0 or dt <= 0:
         raise ValueError("a_accel, a_decel, and dt must be positive.")
 
@@ -429,10 +555,18 @@ def build_speed_profile(seg: Segment, a_accel=1.0, a_decel=1.2, dt=0.5,
     scheduled = float(run_time_s) if run_time_s is not None and run_time_s > 0 else None
     n_signals = max(int(getattr(seg, "n_signals", 0) or 0), 0)
 
-    # Use the default hourly profile unless an explicit mapping is supplied.
-    # To force the old constant-probability behaviour, call build_speed_profile(..., stop_prob_by_hour={})
+    # Independent physical cap: per-segment OSM maxspeed if resolved, else the
+    # config default. NEVER seg.v_cruise_ms -- that is GTFS-derived, and using
+    # it as the cap made feasibility circular (GTFS runtime -> cruise speed ->
+    # cap -> feasibility of the same GTFS runtime).
+    v_cap, cap_source = mp.resolve_cap(seg)
+    target_cruise = min(max(float(seg.v_cruise_ms), 1e-6), v_cap)
+
+    # Use the hourly stop-probability table from motion params unless an
+    # explicit mapping is supplied. Pass stop_prob_by_hour={} to force the
+    # constant-probability behaviour.
     if stop_prob_by_hour is None:
-        stop_prob_by_hour = DEFAULT_STOP_PROB_BY_HOUR
+        stop_prob_by_hour = mp.hour_table_or_none()
 
     effective_stop_prob, signal_hour, signal_prob_source = _signal_stop_prob_for_segment(
         seg,
@@ -460,15 +594,19 @@ def build_speed_profile(seg: Segment, a_accel=1.0, a_decel=1.2, dt=0.5,
         "actual_profile_time_s": 0.0,
         "schedule_delay_s": 0.0,
         "schedule_infeasible": False,
-        "speed_cap_ms": None,
+        "target_cruise_ms": target_cruise,
+        "speed_cap_ms": v_cap,
+        "speed_cap_source": cap_source,
         "min_feasible_motion_time_s": None,
         "n_motion_sublinks": 1,
     }
 
     if n_stops <= 0:
+        min_motion = _freeflow_duration(seg.length_m, v_cap, a_accel, a_decel)
+        diag["min_feasible_motion_time_s"] = min_motion
         profile = _single_segment_profile(seg.length_m, scheduled,
-                                          seg.v_cruise_ms, a_accel, a_decel,
-                                          dt, v_cap=None)
+                                          target_cruise, a_accel, a_decel,
+                                          dt, v_cap=v_cap)
         actual = _profile_duration(profile)
         diag["moving_profile_time_s"] = actual
         diag["actual_profile_time_s"] = actual
@@ -479,7 +617,6 @@ def build_speed_profile(seg: Segment, a_accel=1.0, a_decel=1.2, dt=0.5,
 
     n_sub = n_stops + 1
     sub_len = float(seg.length_m) / n_sub
-    v_cap = max(float(seg.v_cruise_ms), 1e-6)
     min_sub_time = _freeflow_duration(sub_len, v_cap, a_accel, a_decel)
     min_motion_total = min_sub_time * n_sub
     requested_wait = n_stops * max(float(red_wait_s), 0.0)
@@ -491,7 +628,6 @@ def build_speed_profile(seg: Segment, a_accel=1.0, a_decel=1.2, dt=0.5,
 
     diag.update({
         "signal_wait_requested_s": requested_wait,
-        "speed_cap_ms": v_cap,
         "min_feasible_motion_time_s": min_motion_total,
         "n_motion_sublinks": n_sub,
     })
@@ -526,7 +662,7 @@ def build_speed_profile(seg: Segment, a_accel=1.0, a_decel=1.2, dt=0.5,
     moving_time = 0.0
     for k in range(n_sub):
         prof = _single_segment_profile(
-            sub_len, sub_rt, seg.v_cruise_ms, a_accel, a_decel, dt,
+            sub_len, sub_rt, target_cruise, a_accel, a_decel, dt,
             v_cap=v_cap
         )
         parts.append(prof)
@@ -550,7 +686,8 @@ def build_speed_profile(seg: Segment, a_accel=1.0, a_decel=1.2, dt=0.5,
 # ----------------------------------------------------------------------------- 
 # 3. MOTION -> ENERGY : battery energy over one segment
 # -----------------------------------------------------------------------------
-def segment_energy_breakdown_kWh(seg: Segment, p: VehicleParams, soc_start_pct=None):
+def segment_energy_breakdown_kWh(seg: Segment, p: VehicleParams, soc_start_pct=None,
+                                 motion_params: Optional[MotionParams] = None):
     """
     Return battery-side energy accounting for one segment.
 
@@ -570,7 +707,7 @@ def segment_energy_breakdown_kWh(seg: Segment, p: VehicleParams, soc_start_pct=N
     aux_W = aux_kW * 1000.0
 
     (t, v, a, step_s), motion_diag = build_speed_profile(
-        seg, return_diagnostics=True
+        seg, motion_params=motion_params, return_diagnostics=True
     )
 
     net_joules = 0.0
@@ -647,22 +784,26 @@ def segment_energy_breakdown_kWh(seg: Segment, p: VehicleParams, soc_start_pct=N
     )
 
 
-def segment_energy_kWh(seg: Segment, p: VehicleParams, soc_start_pct=None):
+def segment_energy_kWh(seg: Segment, p: VehicleParams, soc_start_pct=None,
+                       motion_params: Optional[MotionParams] = None):
     """Back-compatible alias returning net battery energy, in kWh."""
     return segment_energy_breakdown_kWh(
-        seg, p, soc_start_pct=soc_start_pct
+        seg, p, soc_start_pct=soc_start_pct, motion_params=motion_params
     ).net_battery_energy_kWh
 
 
 # ----------------------------------------------------------------------------- 
 # 4. Simulate a whole route and track SoC
 # -----------------------------------------------------------------------------
-def simulate_route(segments, p: VehicleParams, soc0_pct=100.0):
+def simulate_route(segments, p: VehicleParams, soc0_pct=100.0,
+                   motion_params: Optional[MotionParams] = None):
     rows = []
     soc = soc0_pct
     cum_dist_km = 0.0
     for i, seg in enumerate(segments):
-        energy = segment_energy_breakdown_kWh(seg, p, soc_start_pct=soc)
+        energy = segment_energy_breakdown_kWh(
+            seg, p, soc_start_pct=soc, motion_params=motion_params
+        )
         net_E = energy.net_battery_energy_kWh
         soc_before = soc
         soc -= net_E / p.battery_usable_kWh * 100.0
@@ -679,6 +820,8 @@ def simulate_route(segments, p: VehicleParams, soc0_pct=100.0):
             "length_m": round(seg.length_m, 1),
             "grade_%": round(seg.grade * 100, 2),
             "passengers": seg.passengers,
+            "n_signals": int(getattr(seg, "n_signals", 0) or 0),
+            "signal_source": getattr(seg, "signal_source", None),
             "signal_hour": (energy.motion_diagnostics or {}).get("signal_hour"),
             "signal_stop_prob": round((energy.motion_diagnostics or {}).get(
                 "signal_stop_prob", 0.0
@@ -719,9 +862,15 @@ def simulate_route(segments, p: VehicleParams, soc0_pct=100.0):
             "signal_time_policy": (energy.motion_diagnostics or {}).get(
                 "signal_time_policy"
             ),
+            "target_cruise_ms": round((energy.motion_diagnostics or {}).get(
+                "target_cruise_ms", 0.0
+            ) or 0.0, 3),
             "speed_cap_ms": round((energy.motion_diagnostics or {}).get(
                 "speed_cap_ms", 0.0
             ) or 0.0, 3),
+            "speed_cap_source": (energy.motion_diagnostics or {}).get(
+                "speed_cap_source"
+            ),
             "min_feasible_motion_time_s": round((energy.motion_diagnostics or {}).get(
                 "min_feasible_motion_time_s", 0.0
             ) or 0.0, 3),
@@ -781,8 +930,9 @@ def parse_args():
 def main():
     args = parse_args()
     p = VehicleParams.from_config(args.config)
+    mp = MotionParams.from_config(args.config)
     segments = make_synthetic_route()
-    df = simulate_route(segments, p, soc0_pct=100.0)
+    df = simulate_route(segments, p, soc0_pct=100.0, motion_params=mp)
 
     total_net_E = df["net_battery_energy_kWh"].sum()
     total_gross_E = df["gross_consumed_kWh"].sum()

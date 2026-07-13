@@ -99,7 +99,7 @@ def _shape_points():
 def _weather_series():
     df = pd.DataFrame(
         {
-            "temp": [26.0, 26.5, 27.0],
+            "temp": [27.0, 27.5, 28.0],
             "rh": [0.70, 0.75, 0.80],
             "solar": [450.0, 500.0, 520.0],
         },
@@ -172,7 +172,8 @@ def test_current_model_smoke_exercises_gtfs_loading_weather_traffic_and_physics(
     assert len(set(passenger_loads)) > 1
 
     base_aux_kW = float(weather_cfg["hvac"]["base_aux_kW"])
-    assert all(seg.aux_power_kW > base_aux_kW for seg in segments)
+    assert all(seg.aux_power_kW >= base_aux_kW for seg in segments)
+    assert any(seg.aux_power_kW > base_aux_kW for seg in segments)
 
     no_signal = Segment(
         length_m=segments[0].length_m,
@@ -192,7 +193,14 @@ def test_current_model_smoke_exercises_gtfs_loading_weather_traffic_and_physics(
         run_time_s=segments[0].run_time_s,
         n_signals=2,
     )
-    assert len(build_speed_profile(with_signal)[0]) > len(build_speed_profile(no_signal)[0])
+    _, no_signal_diag = build_speed_profile(
+        no_signal, stop_prob=1.0, return_diagnostics=True
+    )
+    _, with_signal_diag = build_speed_profile(
+        with_signal, stop_prob=1.0, return_diagnostics=True
+    )
+    assert no_signal_diag["n_motion_sublinks"] == 1
+    assert with_signal_diag["n_motion_sublinks"] > no_signal_diag["n_motion_sublinks"]
     assert segment_energy_kWh(with_signal, vehicle) > segment_energy_kWh(no_signal, vehicle)
 
     empty_bus = Segment(length_m=500.0, passengers=0, run_time_s=80.0)

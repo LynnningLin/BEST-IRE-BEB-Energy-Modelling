@@ -65,7 +65,9 @@ if SRC_DIR.exists() and str(SRC_DIR) not in sys.path:
 from best_ire_beb.config import get_path, get_section
 
 # Reuse the vehicle model and Segment dataclass from the sibling file.
-from beb_soc_model import Segment, VehicleParams, simulate_route
+# MotionParams carries the config-driven motion-profile parameters, including
+# the physical speed cap defaults that replaced the GTFS-derived v_cruise cap.
+from beb_soc_model import MotionParams, Segment, VehicleParams, simulate_route
 
 # Passenger demand model. Soft import: if the module is absent the pipeline
 # still runs, it just leaves the flat `passengers` assumption in place.
@@ -103,6 +105,29 @@ except ImportError:
     DEFAULT_SIGNAL_CLUSTER_RADIUS_M = 35.0
     DEFAULT_FALLBACK_PER_KM = 2.0
     _HAS_SIGNALS = False
+
+# OSM maxspeed -> per-segment physical speed cap. Soft import like the others:
+# without it, segments keep speed_cap_ms=None and beb_soc_model falls back to
+# motion.default_speed_cap_ms from the config.
+try:
+    from speed_caps import (add_speed_caps, resolve_speed_caps,
+                            load_speed_cap_cache,
+                            DEFAULT_SPEED_SNAP_RADIUS_M,
+                            DEFAULT_SAMPLE_STEP_M,
+                            DEFAULT_MIN_COVERAGE_FRAC,
+                            DEFAULT_FALLBACK_CAP_KMH,
+                            DEFAULT_MAX_CAP_KMH)
+    _HAS_SPEED_CAPS = True
+except ImportError:
+    add_speed_caps = None
+    resolve_speed_caps = None
+    load_speed_cap_cache = None
+    DEFAULT_SPEED_SNAP_RADIUS_M = 25.0
+    DEFAULT_SAMPLE_STEP_M = 20.0
+    DEFAULT_MIN_COVERAGE_FRAC = 0.5
+    DEFAULT_FALLBACK_CAP_KMH = 50.0
+    DEFAULT_MAX_CAP_KMH = 90.0
+    _HAS_SPEED_CAPS = False
 
 WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday",
             "saturday", "sunday"]
@@ -165,6 +190,12 @@ def load_small_tables(gtfs_zip: str):
     """routes, trips, stops, calendar, calendar_dates are small enough to read."""
     with zipfile.ZipFile(gtfs_zip) as z:
         names = set(z.namelist())
+        required = {"routes.txt", "trips.txt", "stops.txt", "stop_times.txt"}
+        missing = sorted(required - names)
+        if missing:
+            raise ValueError(
+                f"GTFS feed is missing required file(s): {', '.join(missing)}"
+            )
         routes = pd.read_csv(z.open("routes.txt"), dtype={"route_id": str})
         trips = pd.read_csv(
             z.open("trips.txt"),
@@ -179,6 +210,80 @@ def load_small_tables(gtfs_zip: str):
             if "calendar_dates.txt" in names else None
         )
     return routes, trips, stops, calendar, calendar_dates
+
+
+def validate_gtfs_feed(gtfs_zip: str):
+    """Fast Level 1 GTFS integrity checks for static feed inputs."""
+    with zipfile.ZipFile(gtfs_zip) as z:
+        names = set(z.namelist())
+        required = {"routes.txt", "trips.txt", "stops.txt", "stop_times.txt"}
+        missing = sorted(required - names)
+        if missing:
+            raise ValueError(
+                f"GTFS feed is missing required file(s): {', '.join(missing)}"
+            )
+        routes = pd.read_csv(z.open("routes.txt"), dtype=str)
+        trips = pd.read_csv(z.open("trips.txt"), dtype=str)
+        stops = pd.read_csv(z.open("stops.txt"), dtype=str)
+        stop_times = pd.read_csv(z.open("stop_times.txt"), dtype=str)
+
+    required_columns = {
+        "routes.txt": (routes, {"route_id"}),
+        "trips.txt": (trips, {"trip_id", "route_id"}),
+        "stops.txt": (stops, {"stop_id", "stop_lat", "stop_lon"}),
+        "stop_times.txt": (
+            stop_times,
+            {
+                "trip_id",
+                "arrival_time",
+                "departure_time",
+                "stop_id",
+                "stop_sequence",
+            },
+        ),
+    }
+    for filename, (frame, columns) in required_columns.items():
+        missing_cols = sorted(columns - set(frame.columns))
+        if missing_cols:
+            raise ValueError(
+                f"{filename} is missing required column(s): {', '.join(missing_cols)}"
+            )
+
+    bad_stop_ids = sorted(set(stop_times["stop_id"]) - set(stops["stop_id"]))
+    if bad_stop_ids:
+        raise ValueError(f"stop_times references unknown stop_id(s): {bad_stop_ids}")
+
+    bad_trip_ids = sorted(set(stop_times["trip_id"]) - set(trips["trip_id"]))
+    if bad_trip_ids:
+        raise ValueError(f"stop_times references unknown trip_id(s): {bad_trip_ids}")
+
+    bad_route_ids = sorted(set(trips["route_id"]) - set(routes["route_id"]))
+    if bad_route_ids:
+        raise ValueError(f"trips references unknown route_id(s): {bad_route_ids}")
+
+    for trip_id, group in stop_times.groupby("trip_id", sort=False):
+        seq = pd.to_numeric(group["stop_sequence"], errors="coerce")
+        if seq.isna().any():
+            raise ValueError(f"trip {trip_id} has non-numeric stop_sequence")
+        if seq.duplicated().any() or not seq.is_monotonic_increasing:
+            raise ValueError(f"trip {trip_id} stop_sequence values must increase")
+
+        ordered = group.assign(_seq=seq).sort_values("_seq")
+        rows = ordered.to_dict("records")
+        for a, b in zip(rows[:-1], rows[1:]):
+            run_time = (
+                gtfs_time_to_seconds(b["arrival_time"])
+                - gtfs_time_to_seconds(a["departure_time"])
+            )
+            if run_time <= 0:
+                raise ValueError(f"trip {trip_id} has non-positive travel time")
+
+    return {
+        "routes": len(routes),
+        "trips": len(trips),
+        "stops": len(stops),
+        "stop_times": len(stop_times),
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -707,6 +812,7 @@ def segments_for_trip(trip_rows, stops, passengers=20, elevation_data=None,
                       weather_series=None, service_date=None,
                       weather_kwargs=None, shape_points=None,
                       signal_count_map=None, signal_source_map=None,
+                      speed_cap_map=None, speed_cap_source_map=None,
                       verbose=False):
     """
     Full per-trip build. If `demand_profile` is given (a HourlyDemandProfile),
@@ -733,6 +839,13 @@ def segments_for_trip(trip_rows, stops, passengers=20, elevation_data=None,
                                    count_map=signal_count_map,
                                    source_map=signal_source_map,
                                    shape_points=shape_points, verbose=verbose)
+    if speed_cap_map is not None:
+        if not _HAS_SPEED_CAPS:
+            raise RuntimeError("speed_cap_map given but speed_caps.py "
+                               "could not be imported.")
+        segs = add_speed_caps(segs, trip_rows, stops, cap_map=speed_cap_map,
+                              source_map=speed_cap_source_map,
+                              shape_points=shape_points, verbose=verbose)
     if demand_profile is not None:
         if not _HAS_LOADING:
             raise RuntimeError("demand_profile given but passenger_loading.py "
@@ -756,11 +869,13 @@ def segments_for_trip(trip_rows, stops, passengers=20, elevation_data=None,
 # -----------------------------------------------------------------------------
 # Results dataframes
 # -----------------------------------------------------------------------------
-def trip_results_dataframe(segs, trip_info, vehicle_params=None, soc0_pct=100.0):
+def trip_results_dataframe(segs, trip_info, vehicle_params=None, soc0_pct=100.0,
+                           motion_params=None):
     """Simulate one trip and prepend its route/trip metadata to every row."""
     if vehicle_params is None:
         vehicle_params = VehicleParams()
-    df = simulate_route(segs, vehicle_params, soc0_pct=soc0_pct)
+    df = simulate_route(segs, vehicle_params, soc0_pct=soc0_pct,
+                        motion_params=motion_params)
     for col, value in reversed(list(trip_info.items())):
         df.insert(0, col, value)
     return df
@@ -865,6 +980,12 @@ def _print_route_summary(rsn, df, n_trips):
         print(f"  time diag     scheduled {scheduled_h:.2f} h | profile "
               f"{actual_h:.2f} h | delay {delay_h:.2f} h | "
               f"infeasible segments {infeasible}/{len(df)}")
+    if {"speed_cap_ms", "speed_cap_source"}.issubset(df.columns):
+        caps = df["speed_cap_ms"].astype(float)
+        srcs = df["speed_cap_source"].astype(str).value_counts().to_dict()
+        src_txt = ", ".join(f"{k} {v}" for k, v in sorted(srcs.items()))
+        print(f"  speed caps    {caps.min() * 3.6:.0f}-{caps.max() * 3.6:.0f} "
+              f"km/h (median {caps.median() * 3.6:.0f}) | sources: {src_txt}")
 
 
 # -----------------------------------------------------------------------------
@@ -883,6 +1004,14 @@ def process_routes(gtfs_zip, route_short_names, output_dir, tables=None,
                    signals_cluster_m=DEFAULT_SIGNAL_CLUSTER_RADIUS_M,
                    signals_fallback_per_km=DEFAULT_FALLBACK_PER_KM,
                    signals_refresh=False,
+                   motion_params=None,
+                   speed_caps_enabled=False, speed_caps_cache_path=None,
+                   speed_caps_snap_m=DEFAULT_SPEED_SNAP_RADIUS_M,
+                   speed_caps_sample_step_m=DEFAULT_SAMPLE_STEP_M,
+                   speed_caps_min_coverage=DEFAULT_MIN_COVERAGE_FRAC,
+                   speed_caps_default_kmh=DEFAULT_FALLBACK_CAP_KMH,
+                   speed_caps_max_kmh=DEFAULT_MAX_CAP_KMH,
+                   speed_caps_refresh=False,
                    simulation_level="block"):
     """
     For each route: pick trips (by service day, then by start time or ALL),
@@ -948,6 +1077,16 @@ def process_routes(gtfs_zip, route_short_names, output_dir, tables=None,
     if signals_enabled and _HAS_SIGNALS:
         signal_cache = (load_signal_cache(signals_cache_path)
                         if signals_cache_path else {})
+
+    # Speed caps use the same directed-stop-pair keying and shape geometry as
+    # the signal cache, resolved once per route and reused across dates.
+    speed_cap_cache = None
+    if speed_caps_enabled and _HAS_SPEED_CAPS:
+        speed_cap_cache = (load_speed_cap_cache(speed_caps_cache_path)
+                           if speed_caps_cache_path else {})
+
+    if (signals_enabled and _HAS_SIGNALS) or (speed_caps_enabled
+                                              and _HAS_SPEED_CAPS):
         _c = stops.set_index("stop_id")[["stop_lat", "stop_lon"]].to_dict("index")
         stop_coords = {sid: (v["stop_lat"], v["stop_lon"]) for sid, v in _c.items()}
 
@@ -961,24 +1100,29 @@ def process_routes(gtfs_zip, route_short_names, output_dir, tables=None,
         chosen = select_trips_by_start(route_trips, start_times, tolerance_s)
         frames = []
 
-        # Resolve traffic-signal counts ONCE per route (static per stop pair):
-        # cache hit -> OSM fetch (once, route bbox) -> per-km fallback.
+        # Resolve traffic-signal counts and OSM speed caps ONCE per route
+        # (both static per directed stop pair): cache hit -> OSM fetch (once,
+        # route bbox) -> fallback. They share the same shape sub-path geometry.
         route_signal_count_map = route_signal_source_map = None
-        if signals_enabled and _HAS_SIGNALS and chosen:
+        route_speed_cap_map = route_speed_cap_source_map = None
+        want_signals = signals_enabled and _HAS_SIGNALS and chosen
+        want_caps = speed_caps_enabled and _HAS_SPEED_CAPS and chosen
+        route_pairs = route_geom = None
+        if want_signals or want_caps:
             shp_by_trip = {
                 tid: shapes_by_id.get(shape_id_by_trip.get(str(tid), ""))
                 for tid in chosen
             }
-            pairs = route_stop_pairs(
+            route_pairs, route_geom = route_stop_pairs(
                 ((tid, route_trips[tid]) for tid in chosen), stops, shp_by_trip
             )
-            signal_pairs, signal_geom = pairs
+        if want_signals:
             (route_signal_count_map, route_signal_source_map,
              sstats) = resolve_signal_counts(
-                signal_pairs, stop_coords, snap_radius_m=signals_snap_m,
+                route_pairs, stop_coords, snap_radius_m=signals_snap_m,
                 relaxed_snap_radius_m=signals_relaxed_snap_m,
                 cluster_radius_m=signals_cluster_m,
-                fallback_per_km=signals_fallback_per_km, geom_map=signal_geom,
+                fallback_per_km=signals_fallback_per_km, geom_map=route_geom,
                 cache=signal_cache, cache_path=signals_cache_path,
                 refresh=signals_refresh, verbose=True)
             print(f"  signals: route {rsn} -> {sstats['n_pairs']} stop-pair(s) "
@@ -986,6 +1130,21 @@ def process_routes(gtfs_zip, route_short_names, output_dir, tables=None,
                   f"relaxed {sstats.get('osm_relaxed', 0)}, "
                   f"fallback {sstats['fallback']}] "
                   f"-> {sstats['total_signals']} signals")
+        if want_caps:
+            (route_speed_cap_map, route_speed_cap_source_map,
+             cstats) = resolve_speed_caps(
+                route_pairs, stop_coords, snap_radius_m=speed_caps_snap_m,
+                sample_step_m=speed_caps_sample_step_m,
+                min_coverage_frac=speed_caps_min_coverage,
+                default_cap_kmh=speed_caps_default_kmh,
+                max_cap_kmh=speed_caps_max_kmh, geom_map=route_geom,
+                cache=speed_cap_cache, cache_path=speed_caps_cache_path,
+                refresh=speed_caps_refresh, verbose=True)
+            print(f"  speed caps: route {rsn} -> {cstats['n_pairs']} "
+                  f"stop-pair(s) [cache {cstats['cache_hit']}, "
+                  f"OSM {cstats['osm']}, imputed {cstats['imputed']}, "
+                  f"low-coverage {cstats['fallback_low_coverage']}, "
+                  f"fallback {cstats['fallback']}]")
 
         groups = _duty_groups(
             chosen, route_trips, service_by_trip, block_by_trip, simulation_level
@@ -1012,6 +1171,8 @@ def process_routes(gtfs_zip, route_short_names, output_dir, tables=None,
                     shape_points=shape_points,
                     signal_count_map=route_signal_count_map,
                     signal_source_map=route_signal_source_map,
+                    speed_cap_map=route_speed_cap_map,
+                    speed_cap_source_map=route_speed_cap_source_map,
                 )
                 info = {
                     "route_short_name": rsn,
@@ -1032,7 +1193,8 @@ def process_routes(gtfs_zip, route_short_names, output_dir, tables=None,
                     "trip_start_soc_%": round(trip_start_soc, 2),
                 }
                 frame = trip_results_dataframe(
-                    segs, info, vehicle_params, soc0_pct=trip_start_soc
+                    segs, info, vehicle_params, soc0_pct=trip_start_soc,
+                    motion_params=motion_params,
                 )
                 duty_soc = float(frame["SoC_end_%"].iloc[-1])
                 frame["trip_end_soc_%"] = round(duty_soc, 2)
@@ -1123,6 +1285,8 @@ def load_demand_profile_csv(path, city=None):
     if hcol is None or vcol is None:
         raise ValueError("demand CSV needs an 'hour' column and a "
                          "percent/share/flow column.")
+    if df[hcol].nunique() != 24:
+        print(f"  warning: demand profile has {df[hcol].nunique()} hours, not 24.")
     mapping = {int(h): float(v) for h, v in zip(df[hcol], df[vcol])}
     return HourlyDemandProfile.from_percent(mapping)
 
@@ -1178,6 +1342,7 @@ def parse_args():
     loading_cfg = get_section("passenger_loading", config_path)
     weather_cfg = get_section("weather", config_path)
     signals_cfg = get_section("traffic_signals", config_path)
+    speed_caps_cfg = get_section("speed_caps", config_path)
 
     default_gtfs = get_path("gtfs_zip", config_path)
     default_output_dir = get_path("gtfs_output_dir", config_path)
@@ -1185,6 +1350,7 @@ def parse_args():
     default_demand_csv = get_path("passenger_loading_csv", config_path)
     default_weather_csv = get_path("weather_csv", config_path)
     default_signals_csv = get_path("traffic_signals_csv", config_path)
+    default_speed_caps_csv = get_path("speed_caps_csv", config_path)
 
     p = argparse.ArgumentParser(
         description="GTFS route short names -> per-trip BEB segment CSVs.",
@@ -1266,6 +1432,44 @@ def parse_args():
     p.add_argument("--refresh-signals", action="store_true",
                    default=bool(signals_cfg.get("refresh", False)),
                    help="Ignore cached signal counts and re-fetch from OSM.")
+    # OSM speed caps (independent physical speed limit per segment)
+    caps_toggle = p.add_mutually_exclusive_group()
+    caps_toggle.add_argument("--speed-caps", dest="speed_caps_enabled",
+                             action="store_true",
+                             help="Enable OSM maxspeed -> per-segment speed cap.")
+    caps_toggle.add_argument("--no-speed-caps", dest="speed_caps_enabled",
+                             action="store_false",
+                             help="Skip OSM speed caps; use the config default "
+                                  "cap (motion.default_speed_cap_ms).")
+    p.set_defaults(speed_caps_enabled=bool(speed_caps_cfg.get("enabled", True)))
+    p.add_argument("--speed-caps-csv", default=str(default_speed_caps_csv or ""),
+                   help="Speed-cap cache CSV (keyed by stop pair). Fetched once "
+                        "and reused across dates/routes.")
+    p.add_argument("--speed-caps-snap-m", type=float,
+                   default=float(speed_caps_cfg.get(
+                       "snap_radius_m", DEFAULT_SPEED_SNAP_RADIUS_M)),
+                   help="Max distance (m) from a route sample to an OSM way.")
+    p.add_argument("--speed-caps-sample-step-m", type=float,
+                   default=float(speed_caps_cfg.get(
+                       "sample_step_m", DEFAULT_SAMPLE_STEP_M)),
+                   help="Sample spacing (m) along the shape sub-path; the cap "
+                        "is the length-weighted harmonic mean of matches.")
+    p.add_argument("--speed-caps-min-coverage", type=float,
+                   default=float(speed_caps_cfg.get(
+                       "min_coverage_frac", DEFAULT_MIN_COVERAGE_FRAC)),
+                   help="Matched-length fraction below which the default cap "
+                        "is used instead.")
+    p.add_argument("--speed-caps-default-kmh", type=float,
+                   default=float(speed_caps_cfg.get(
+                       "default_cap_kmh", DEFAULT_FALLBACK_CAP_KMH)),
+                   help="Fallback cap (km/h) when OSM is unavailable/uncovered.")
+    p.add_argument("--speed-caps-max-kmh", type=float,
+                   default=float(speed_caps_cfg.get(
+                       "max_cap_kmh", DEFAULT_MAX_CAP_KMH)),
+                   help="Sanity clamp (km/h) on resolved caps.")
+    p.add_argument("--refresh-speed-caps", action="store_true",
+                   default=bool(speed_caps_cfg.get("refresh", False)),
+                   help="Ignore cached speed caps and re-fetch from OSM.")
     p.add_argument("--crush-capacity", type=int,
                    default=int(loading_cfg.get("crush_capacity", 70)),
                    help="Override passenger_loading.crush_capacity.")
@@ -1385,6 +1589,36 @@ if __name__ == "__main__":
               f"cluster={args.signals_cluster_m:.0f} m, "
               f"fallback={args.signals_fallback_per_km:.1f}/km, {mode})")
 
+    # OSM speed caps: config-driven with --speed-caps / --no-speed-caps as
+    # one-off overrides. Static per stop pair -> fetched once, cached, reused.
+    motion_params = MotionParams.from_config(args.config)
+    speed_caps_enabled = _HAS_SPEED_CAPS and args.speed_caps_enabled
+    speed_caps_cache_path = args.speed_caps_csv or None
+    if not _HAS_SPEED_CAPS:
+        print("Speed caps: OFF (speed_caps.py could not be imported) -> "
+              f"config default cap {motion_params.default_speed_cap_ms * 3.6:.0f} "
+              "km/h on every segment.")
+    elif not args.speed_caps_enabled:
+        print("Speed caps: OFF (speed_caps.enabled=false / --no-speed-caps) -> "
+              f"config default cap {motion_params.default_speed_cap_ms * 3.6:.0f} "
+              "km/h on every segment.")
+    elif not speed_caps_cache_path:
+        print("Speed caps: OFF (no --speed-caps-csv / paths.speed_caps_csv set) "
+              f"-> config default cap "
+              f"{motion_params.default_speed_cap_ms * 3.6:.0f} km/h.")
+        speed_caps_enabled = False
+    else:
+        mode = "refresh -> re-fetch" if args.refresh_speed_caps else "cache-first"
+        print(f"Speed caps: ON  (cache={speed_caps_cache_path}, "
+              f"snap={args.speed_caps_snap_m:.0f} m, "
+              f"step={args.speed_caps_sample_step_m:.0f} m, "
+              f"fallback={args.speed_caps_default_kmh:.0f} km/h, "
+              f"clamp={args.speed_caps_max_kmh:.0f} km/h, {mode})")
+    print(f"Motion: accel={motion_params.accel_ms2:.1f} m/s2, "
+          f"decel={motion_params.decel_ms2:.1f} m/s2, "
+          f"default cap={motion_params.default_speed_cap_ms * 3.6:.0f} km/h, "
+          f"policy={motion_params.signal_time_policy}")
+
     tables = load_small_tables(Path(args.gtfs))
     elevation_data = srtm.get_data(local_cache_dir=str(args.srtm_cache_dir))
     vehicle_params = VehicleParams.from_config(args.config)
@@ -1406,6 +1640,15 @@ if __name__ == "__main__":
         signals_cluster_m=args.signals_cluster_m,
         signals_fallback_per_km=args.signals_fallback_per_km,
         signals_refresh=args.refresh_signals,
+        motion_params=motion_params,
+        speed_caps_enabled=speed_caps_enabled,
+        speed_caps_cache_path=speed_caps_cache_path,
+        speed_caps_snap_m=args.speed_caps_snap_m,
+        speed_caps_sample_step_m=args.speed_caps_sample_step_m,
+        speed_caps_min_coverage=args.speed_caps_min_coverage,
+        speed_caps_default_kmh=args.speed_caps_default_kmh,
+        speed_caps_max_kmh=args.speed_caps_max_kmh,
+        speed_caps_refresh=args.refresh_speed_caps,
         simulation_level=args.simulation_level,
     )
     print(f"\nProcessed {len(route_short_names)} route(s) -> {len(saved)} file(s).")
