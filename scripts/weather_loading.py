@@ -347,6 +347,14 @@ def load_weather_csv(path=None, time_col=None, temp_col=None,
         out["solar"] = pd.to_numeric(raw[scol], errors="coerce").clip(lower=0.0)
     out.index = ts
     out = out[out.index.notna() & out["temp"].notna()]
+    if out.empty:
+        raise ValueError(f"{path} contains no valid timestamp/temperature rows")
+    if "rh" in out.columns:
+        bad_rh = out["rh"].dropna()
+        if ((bad_rh < 0.0) | (bad_rh > 1.0)).any():
+            raise ValueError("relative humidity must be within [0, 1] after conversion")
+    if out.index.has_duplicates:
+        raise ValueError("weather timestamps must be unique")
 
     if verbose:
         span = f"{out.index.min()} -> {out.index.max()}"

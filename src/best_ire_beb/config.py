@@ -27,6 +27,7 @@ _BUILTIN_DEFAULTS: dict[str, Any] = {
         "gtfs_output_dir": "data/processed",
         "srtm_cache_dir": "data/srtm_cache",
         "traffic_signals_csv": "data/processed/traffic_signals.csv",
+        "speed_caps_csv": "data/processed/speed_caps.csv",
         "synthetic_segment_results_csv": "data/processed/beb_segment_results.csv",
         "synthetic_soc_trace_png": "reports/figures/beb_soc_trace.png",
     },
@@ -105,6 +106,38 @@ _BUILTIN_DEFAULTS: dict[str, Any] = {
         "fallback_per_km": 2.0,
         "refresh": False,
     },
+    # Motion-profile parameters for beb_soc_model.build_speed_profile().
+    # These separate the PHYSICAL speed cap from the GTFS-derived target cruise
+    # speed: the cap bounds what the vehicle may do; GTFS only shapes the target.
+    "motion": {
+        "accel_ms2": 1.0,
+        "decel_ms2": 1.2,
+        "dt_s": 0.5,
+        # Cap used when a segment has no seg.speed_cap_ms (e.g. speed_caps
+        # disabled or OSM unresolved). 13.9 m/s = 50 km/h Irish urban default.
+        "default_speed_cap_ms": 13.9,
+        # Sanity clamp on any per-segment cap (OSM errors, unit mix-ups).
+        # 25.0 m/s = 90 km/h.
+        "max_speed_cap_ms": 25.0,
+        "stop_prob": 0.5,
+        "red_wait_s": 15.0,
+        "signal_time_policy": "preserve_schedule",
+        "max_signal_wait_share": 0.35,
+        "use_hourly_signal_stop_probability": True,
+        # Optional {hour: probability} mapping; None -> module default table.
+        "stop_prob_by_hour": None,
+    },
+    # OSM maxspeed resolution for per-segment physical speed caps
+    # (scripts/speed_caps.py; mirrors the traffic_signals cache workflow).
+    "speed_caps": {
+        "enabled": True,
+        "snap_radius_m": 25.0,
+        "sample_step_m": 20.0,
+        "min_coverage_frac": 0.5,
+        "default_cap_kmh": 50.0,
+        "max_cap_kmh": 90.0,
+        "refresh": False,
+    },
 }
 
 
@@ -163,9 +196,171 @@ def get_path(
 
 
 def vehicle_params(config_path: str | Path | None = None) -> dict[str, float]:
-    return {k: float(v) for k, v in get_section("vehicle", config_path).items()}
+    params = {k: float(v) for k, v in get_section("vehicle", config_path).items()}
+    _validate_vehicle_params(params)
+    return params
+
+
+def motion_params(config_path: str | Path | None = None) -> dict[str, Any]:
+    """Motion-profile parameters (mixed types: floats, str policy, dict table)."""
+    return dict(get_section("motion", config_path))
+
+
+def speed_cap_params(config_path: str | Path | None = None) -> dict[str, Any]:
+    """OSM maxspeed resolution parameters for scripts/speed_caps.py."""
+    return dict(get_section("speed_caps", config_path))
 
 
 DATA_DIR = get_path("data_dir")
 RAW_DATA_DIR = get_path("raw_data_dir")
 PROCESSED_DATA_DIR = get_path("processed_data_dir")
+
+
+def _require_keys(section_name: str, section: dict[str, Any], keys: set[str]) -> None:
+    missing = sorted(keys - set(section))
+    if missing:
+        raise ValueError(
+            f"config section {section_name!r} is missing required key(s): "
+            f"{', '.join(missing)}"
+        )
+
+
+def _require_positive(name: str, value: Any) -> None:
+    if float(value) <= 0:
+        raise ValueError(f"{name} must be positive.")
+
+
+def _require_non_negative(name: str, value: Any) -> None:
+    if float(value) < 0:
+        raise ValueError(f"{name} must be non-negative.")
+
+
+def _require_interval(name: str, value: Any, low: float, high: float) -> None:
+    numeric = float(value)
+    if not (low <= numeric <= high):
+        raise ValueError(f"{name} must lie within [{low}, {high}].")
+
+
+def _require_open_closed_interval(
+    name: str, value: Any, low: float, high: float
+) -> None:
+    numeric = float(value)
+    if not (low < numeric <= high):
+        raise ValueError(f"{name} must lie within ({low}, {high}].")
+
+
+def _validate_vehicle_params(params: dict[str, float]) -> None:
+    _require_positive("vehicle.curb_mass_kg", params["curb_mass_kg"])
+    _require_positive("vehicle.battery_usable_kWh", params["battery_usable_kWh"])
+    _require_non_negative("vehicle.aux_power_kW", params["aux_power_kW"])
+    _require_open_closed_interval(
+        "vehicle.eta_driveline", params["eta_driveline"], 0.0, 1.0
+    )
+    _require_open_closed_interval("vehicle.eta_motor", params["eta_motor"], 0.0, 1.0)
+    _require_interval("vehicle.regen_fraction", params["regen_fraction"], 0.0, 1.0)
+
+
+def validate_config(
+    config_path: str | Path | None = None,
+    *,
+    require_existing_paths: bool = False,
+) -> dict[str, Any]:
+    """Validate Level 1 config structure and physical bounds.
+
+    The returned config is the same defaults-merged mapping produced by
+    ``load_config``. Path existence checks are opt-in because output paths are
+    often created later, while CI tests usually use synthetic files.
+    """
+    cfg = load_config(config_path)
+    required = {
+        "simulation": {"date"},
+        "paths": {
+            "data_dir",
+            "raw_data_dir",
+            "processed_data_dir",
+            "gtfs_zip",
+            "passenger_loading_csv",
+            "weather_csv",
+            "traffic_signals_csv",
+            "speed_caps_csv",
+        },
+        "vehicle": {
+            "curb_mass_kg",
+            "eta_driveline",
+            "eta_motor",
+            "regen_fraction",
+            "aux_power_kW",
+            "battery_usable_kWh",
+        },
+        "gtfs": {"default_routes", "simulation_level", "flat_passengers"},
+        "passenger_loading": {"demand_city", "crush_capacity", "enabled"},
+        "traffic_signals": {"enabled", "snap_radius_m", "fallback_per_km"},
+        "motion": {
+            "accel_ms2",
+            "decel_ms2",
+            "dt_s",
+            "default_speed_cap_ms",
+            "max_speed_cap_ms",
+            "stop_prob",
+            "red_wait_s",
+            "max_signal_wait_share",
+        },
+        "speed_caps": {
+            "enabled",
+            "snap_radius_m",
+            "sample_step_m",
+            "min_coverage_frac",
+            "default_cap_kmh",
+            "max_cap_kmh",
+        },
+        "weather": {"enabled", "climate_control", "hvac"},
+    }
+    for section_name, keys in required.items():
+        section = cfg.get(section_name)
+        if not isinstance(section, dict):
+            raise ValueError(f"config section {section_name!r} must be a mapping.")
+        _require_keys(section_name, section, keys)
+
+    paths = cfg["paths"]
+    path_keys = (
+        "gtfs_zip",
+        "passenger_loading_csv",
+        "weather_csv",
+        "traffic_signals_csv",
+        "speed_caps_csv",
+    )
+    for key in path_keys:
+        resolved = project_path(paths[key])
+        if require_existing_paths and (resolved is None or not resolved.exists()):
+            raise FileNotFoundError(f"configured path paths.{key} does not exist: {resolved}")
+
+    _validate_vehicle_params({k: float(v) for k, v in cfg["vehicle"].items()})
+
+    motion = cfg["motion"]
+    _require_positive("motion.accel_ms2", motion["accel_ms2"])
+    _require_positive("motion.decel_ms2", motion["decel_ms2"])
+    _require_positive("motion.dt_s", motion["dt_s"])
+    _require_positive("motion.default_speed_cap_ms", motion["default_speed_cap_ms"])
+    _require_positive("motion.max_speed_cap_ms", motion["max_speed_cap_ms"])
+    _require_interval("motion.stop_prob", motion["stop_prob"], 0.0, 1.0)
+    _require_non_negative("motion.red_wait_s", motion["red_wait_s"])
+    _require_interval(
+        "motion.max_signal_wait_share", motion["max_signal_wait_share"], 0.0, 1.0
+    )
+    table = motion.get("stop_prob_by_hour")
+    if table:
+        for hour, value in dict(table).items():
+            _require_interval(f"motion.stop_prob_by_hour[{hour}]", value, 0.0, 1.0)
+
+    loading = cfg["passenger_loading"]
+    _require_positive("passenger_loading.crush_capacity", loading["crush_capacity"])
+
+    climate = cfg["weather"]["climate_control"]
+    _require_keys("weather.climate_control", climate, {"heat_below_c", "cool_above_c"})
+    if float(climate["heat_below_c"]) >= float(climate["cool_above_c"]):
+        raise ValueError("weather heat_below_c must be below cool_above_c.")
+    hvac = cfg["weather"]["hvac"]
+    _require_keys("weather.hvac", hvac, {"hvac_max_kW"})
+    _require_non_negative("weather.hvac.hvac_max_kW", hvac["hvac_max_kW"])
+
+    return cfg

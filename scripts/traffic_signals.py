@@ -387,13 +387,23 @@ def load_signal_cache(path):
     with path.open(newline="") as fh:
         for row in csv.DictReader(fh):
             key = (str(row["from_stop_id"]), str(row["to_stop_id"]))
+            if key in cache:
+                raise ValueError(f"duplicate signal cache row for stop pair {key}")
             row["n_signals"] = int(float(row["n_signals"]))
+            if row["n_signals"] < 0:
+                raise ValueError(f"signal count must be non-negative for stop pair {key}")
+            if row.get("source") not in {"osm", "osm_relaxed", "fallback"}:
+                raise ValueError(f"invalid signal cache source for stop pair {key}")
             row["snap_radius_m"] = float(row["snap_radius_m"])
+            if row["snap_radius_m"] <= 0:
+                raise ValueError(f"snap_radius_m must be positive for stop pair {key}")
             row["relaxed_snap_radius_m"] = float(
                 row.get("relaxed_snap_radius_m") or 0.0
             )
             row["cluster_radius_m"] = float(row.get("cluster_radius_m") or 0.0)
             row["length_m"] = float(row.get("length_m") or 0.0)
+            if row["length_m"] < 0:
+                raise ValueError(f"length_m must be non-negative for stop pair {key}")
             cache[key] = row
     return cache
 

@@ -42,6 +42,10 @@ paths:
   # traffic_signals_csv is used by the energy model to estimate stop-and-go losses.
   traffic_signals_csv: data/processed/traffic_signals.csv
 
+  # speed_caps_csv caches per stop-pair physical speed caps resolved from OSM
+  # maxspeed tags (scripts/speed_caps.py). Fetched once, reused across dates.
+  speed_caps_csv: data/processed/speed_caps.csv
+
 # ## Vehicle and Battery Parameters
 # These describe the representative BEB used by the energy model.
 vehicle:
@@ -157,6 +161,76 @@ traffic_signals:
   fallback_per_km: 2.0
 
   # Set true to ignore cached signal counts and re-fetch from OSM.
+  refresh: false
+
+# ## Motion Profile Defaults
+# Used by beb_soc_model.build_speed_profile(). These deliberately separate three
+# concepts that used to be conflated:
+#   * scheduled average speed  -- length_m / GTFS run_time_s (data, not a limit)
+#   * target cruise speed      -- Segment.v_cruise_ms, GTFS-derived, shapes the
+#                                 free-flow profile only
+#   * physical speed cap       -- Segment.speed_cap_ms (OSM maxspeed) or
+#                                 default_speed_cap_ms; the ONLY feasibility limit
+motion:
+  # Comfortable service acceleration / deceleration for a 12 m BEB.
+  accel_ms2: 1.0
+  decel_ms2: 1.2
+
+  # Speed-profile integration step.
+  dt_s: 0.5
+
+  # Physical cap used when a segment has no OSM-resolved seg.speed_cap_ms.
+  # 13.9 m/s = 50 km/h (Irish urban default limit).
+  default_speed_cap_ms: 13.9
+
+  # Sanity clamp applied to any per-segment cap. 25.0 m/s = 90 km/h.
+  max_speed_cap_ms: 25.0
+
+  # Constant fallback probability that one signal forces a full stop
+  # (used when use_hourly_signal_stop_probability is false or hour is missing).
+  stop_prob: 0.5
+
+  # Seconds of idle wait per actual signal stop.
+  red_wait_s: 15.0
+
+  # preserve_schedule: red-light waiting is internal schedule slack (GTFS
+  # run times already include average junction delay). add_delay: waits are
+  # added on top (sensitivity analysis only).
+  signal_time_policy: preserve_schedule
+
+  # Cap on the idle share of scheduled run time attributable to signals.
+  max_signal_wait_share: 0.35
+
+  # Use the hour-of-day signal stop probability table.
+  use_hourly_signal_stop_probability: true
+
+  # Optional hour -> probability mapping; omit/null to use the module default.
+  stop_prob_by_hour: null
+
+# ## OSM Speed Cap Defaults (scripts/speed_caps.py)
+speed_caps:
+  # Set false to skip OSM maxspeed lookup; segments then use
+  # motion.default_speed_cap_ms with source "config_default".
+  enabled: true
+
+  # Max distance from a route sample point to an OSM way for a speed match.
+  snap_radius_m: 25.0
+
+  # Spacing of sample points along each stop-pair shape sub-path. The cap is the
+  # length-weighted harmonic mean of matched samples, which preserves the true
+  # minimum traversal time sum(L_i / v_i).
+  sample_step_m: 20.0
+
+  # Below this matched-sample fraction, fall back to default_cap_kmh.
+  min_coverage_frac: 0.5
+
+  # Fallback cap when OSM is unavailable or coverage is poor.
+  default_cap_kmh: 50.0
+
+  # Sanity clamp on resolved caps.
+  max_cap_kmh: 90.0
+
+  # Set true to ignore cached caps and re-fetch from OSM.
   refresh: false
 
 # ## Weather and HVAC Defaults
