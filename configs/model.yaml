@@ -42,6 +42,9 @@ paths:
   # traffic_signals_csv is used by the energy model to estimate stop-and-go losses.
   traffic_signals_csv: data/processed/traffic_signals.csv
 
+  # Event-level OSM traffic-signal cache: one row per clustered signal event.
+  traffic_signal_events_csv: data/processed/traffic_signal_events.csv
+
   # speed_caps_csv caches per stop-pair physical speed caps resolved from OSM
   # maxspeed tags (scripts/speed_caps.py). Fetched once, reused across dates.
   speed_caps_csv: data/processed/speed_caps.csv

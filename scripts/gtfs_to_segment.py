@@ -90,6 +90,7 @@ except ImportError:
 try:
     from traffic_signals import (add_traffic_signals, resolve_signal_counts,
                                  route_stop_pairs, load_signal_cache,
+                                 load_signal_event_cache,
                                  DEFAULT_SNAP_RADIUS_M,
                                  DEFAULT_RELAXED_SNAP_RADIUS_M,
                                  DEFAULT_SIGNAL_CLUSTER_RADIUS_M,
@@ -100,6 +101,7 @@ except ImportError:
     resolve_signal_counts = None
     route_stop_pairs = None
     load_signal_cache = None
+    load_signal_event_cache = None
     DEFAULT_SNAP_RADIUS_M = 30.0
     DEFAULT_RELAXED_SNAP_RADIUS_M = 60.0
     DEFAULT_SIGNAL_CLUSTER_RADIUS_M = 35.0
@@ -811,6 +813,7 @@ def segments_for_trip(trip_rows, stops, passengers=20, elevation_data=None,
                       crush_capacity=70, loading_kwargs=None,
                       weather_series=None, service_date=None,
                       weather_kwargs=None, shape_points=None,
+                      shape_id=None,
                       signal_count_map=None, signal_source_map=None,
                       speed_cap_map=None, speed_cap_source_map=None,
                       verbose=False):
@@ -838,7 +841,8 @@ def segments_for_trip(trip_rows, stops, passengers=20, elevation_data=None,
         segs = add_traffic_signals(segs, trip_rows, stops,
                                    count_map=signal_count_map,
                                    source_map=signal_source_map,
-                                   shape_points=shape_points, verbose=verbose)
+                                   shape_points=shape_points, shape_id=shape_id,
+                                   verbose=verbose)
     if speed_cap_map is not None:
         if not _HAS_SPEED_CAPS:
             raise RuntimeError("speed_cap_map given but speed_caps.py "
@@ -999,6 +1003,7 @@ def process_routes(gtfs_zip, route_short_names, output_dir, tables=None,
                    srtm_cache_dir=None, demand_profile=None, crush_capacity=70,
                    loading_kwargs=None, weather_series=None, weather_kwargs=None,
                    signals_enabled=False, signals_cache_path=None,
+                   signal_events_cache_path=None,
                    signals_snap_m=DEFAULT_SNAP_RADIUS_M,
                    signals_relaxed_snap_m=DEFAULT_RELAXED_SNAP_RADIUS_M,
                    signals_cluster_m=DEFAULT_SIGNAL_CLUSTER_RADIUS_M,
@@ -1073,10 +1078,13 @@ def process_routes(gtfs_zip, route_short_names, output_dir, tables=None,
     # Signals: load the shared cache once (accumulates across routes) and the
     # stop coordinate lookup used to resolve any pairs not already cached.
     signal_cache = None
+    signal_event_cache = None
     stop_coords = None
     if signals_enabled and _HAS_SIGNALS:
         signal_cache = (load_signal_cache(signals_cache_path)
                         if signals_cache_path else {})
+        signal_event_cache = (load_signal_event_cache(signal_events_cache_path)
+                              if signal_events_cache_path else {})
 
     # Speed caps use the same directed-stop-pair keying and shape geometry as
     # the signal cache, resolved once per route and reused across dates.
@@ -1108,7 +1116,8 @@ def process_routes(gtfs_zip, route_short_names, output_dir, tables=None,
         want_signals = signals_enabled and _HAS_SIGNALS and chosen
         want_caps = speed_caps_enabled and _HAS_SPEED_CAPS and chosen
         route_pairs = route_geom = None
-        if want_signals or want_caps:
+        signal_route_pairs = signal_route_geom = None
+        if want_caps:
             shp_by_trip = {
                 tid: shapes_by_id.get(shape_id_by_trip.get(str(tid), ""))
                 for tid in chosen
@@ -1117,19 +1126,36 @@ def process_routes(gtfs_zip, route_short_names, output_dir, tables=None,
                 ((tid, route_trips[tid]) for tid in chosen), stops, shp_by_trip
             )
         if want_signals:
+            shp_by_trip = {
+                tid: shapes_by_id.get(shape_id_by_trip.get(str(tid), ""))
+                for tid in chosen
+            }
+            shp_id_by_trip = {
+                str(tid): shape_id_by_trip.get(str(tid), "")
+                for tid in chosen
+            }
+            signal_route_pairs, signal_route_geom = route_stop_pairs(
+                ((tid, route_trips[tid]) for tid in chosen), stops, shp_by_trip,
+                shape_id_by_trip=shp_id_by_trip, include_geometry_id=True
+            )
+        if want_signals:
             (route_signal_count_map, route_signal_source_map,
              sstats) = resolve_signal_counts(
-                route_pairs, stop_coords, snap_radius_m=signals_snap_m,
+                signal_route_pairs, stop_coords, snap_radius_m=signals_snap_m,
                 relaxed_snap_radius_m=signals_relaxed_snap_m,
                 cluster_radius_m=signals_cluster_m,
-                fallback_per_km=signals_fallback_per_km, geom_map=route_geom,
+                fallback_per_km=signals_fallback_per_km,
+                geom_map=signal_route_geom,
                 cache=signal_cache, cache_path=signals_cache_path,
+                event_cache=signal_event_cache,
+                event_cache_path=signal_events_cache_path,
                 refresh=signals_refresh, verbose=True)
             print(f"  signals: route {rsn} -> {sstats['n_pairs']} stop-pair(s) "
                   f"[cache {sstats['cache_hit']}, OSM {sstats['osm']}, "
                   f"relaxed {sstats.get('osm_relaxed', 0)}, "
                   f"fallback {sstats['fallback']}] "
-                  f"-> {sstats['total_signals']} signals")
+                  f"-> {sstats['total_signals']} signals "
+                  f"({sstats.get('event_rows', 0)} event rows)")
         if want_caps:
             (route_speed_cap_map, route_speed_cap_source_map,
              cstats) = resolve_speed_caps(
@@ -1161,6 +1187,7 @@ def process_routes(gtfs_zip, route_short_names, output_dir, tables=None,
                 rows = route_trips[tid]
                 trip_start_soc = duty_soc
                 shape_points = shapes_by_id.get(shape_id_by_trip.get(str(tid), ""))
+                trip_shape_id = shape_id_by_trip.get(str(tid), "")
                 segs = segments_for_trip(
                     rows, stops, passengers=passengers,
                     elevation_data=elevation_data, srtm_cache_dir=srtm_cache_dir,
@@ -1169,6 +1196,7 @@ def process_routes(gtfs_zip, route_short_names, output_dir, tables=None,
                     weather_series=weather_series, service_date=service_date,
                     weather_kwargs=weather_kwargs,
                     shape_points=shape_points,
+                    shape_id=trip_shape_id,
                     signal_count_map=route_signal_count_map,
                     signal_source_map=route_signal_source_map,
                     speed_cap_map=route_speed_cap_map,
@@ -1350,6 +1378,7 @@ def parse_args():
     default_demand_csv = get_path("passenger_loading_csv", config_path)
     default_weather_csv = get_path("weather_csv", config_path)
     default_signals_csv = get_path("traffic_signals_csv", config_path)
+    default_signal_events_csv = get_path("traffic_signal_events_csv", config_path)
     default_speed_caps_csv = get_path("speed_caps_csv", config_path)
 
     p = argparse.ArgumentParser(
@@ -1413,6 +1442,10 @@ def parse_args():
     p.add_argument("--signals-csv", default=str(default_signals_csv or ""),
                    help="Traffic-signal count cache CSV (keyed by stop pair). "
                         "Fetched once and reused across dates/routes.")
+    p.add_argument("--signal-events-csv",
+                   default=str(default_signal_events_csv or ""),
+                   help="Event-level traffic-signal cache CSV, one row per "
+                        "clustered route-relevant signal.")
     p.add_argument("--signals-snap-m", type=float,
                    default=float(signals_cfg.get("snap_radius_m",
                                                  DEFAULT_SNAP_RADIUS_M)),
@@ -1574,6 +1607,7 @@ if __name__ == "__main__":
     # and routes.
     signals_enabled = _HAS_SIGNALS and args.signals_enabled
     signals_cache_path = args.signals_csv or None
+    signal_events_cache_path = args.signal_events_csv or None
     if not _HAS_SIGNALS:
         print("Traffic signals: OFF (traffic_signals.py could not be imported).")
     elif not args.signals_enabled:
@@ -1584,6 +1618,7 @@ if __name__ == "__main__":
     else:
         mode = "refresh -> re-fetch" if args.refresh_signals else "cache-first"
         print(f"Traffic signals: ON  (cache={signals_cache_path}, "
+              f"events={signal_events_cache_path or 'none'}, "
               f"snap={args.signals_snap_m:.0f} m, "
               f"relaxed={args.signals_relaxed_snap_m:.0f} m, "
               f"cluster={args.signals_cluster_m:.0f} m, "
@@ -1635,6 +1670,7 @@ if __name__ == "__main__":
         loading_kwargs=loading_kwargs,
         weather_series=weather_series, weather_kwargs=weather_kwargs,
         signals_enabled=signals_enabled, signals_cache_path=signals_cache_path,
+        signal_events_cache_path=signal_events_cache_path,
         signals_snap_m=args.signals_snap_m,
         signals_relaxed_snap_m=args.signals_relaxed_snap_m,
         signals_cluster_m=args.signals_cluster_m,

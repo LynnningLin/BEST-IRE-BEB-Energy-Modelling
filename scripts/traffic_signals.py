@@ -44,6 +44,8 @@ PUBLIC API
 """
 
 import csv
+import hashlib
+import json
 import time
 from math import radians, cos, sin, asin, sqrt
 from pathlib import Path
@@ -66,10 +68,79 @@ OSM_SIGNAL_TAG_QUERIES = [
 OSM_SIGNAL_DEDUP_RADIUS_M = 2.0
 
 SIGNAL_CACHE_COLUMNS = [
+    "segment_geometry_id", "shape_id",
     "from_stop_id", "to_stop_id", "n_signals", "source",
     "snap_radius_m", "relaxed_snap_radius_m", "cluster_radius_m",
     "length_m", "fetched_utc",
 ]
+
+SIGNAL_EVENT_CACHE_COLUMNS = [
+    "signal_event_id", "segment_geometry_id", "from_stop_id", "to_stop_id",
+    "shape_id", "signal_lat", "signal_lon", "distance_along_segment_m",
+    "segment_length_m", "source", "snap_radius_m", "relaxed_snap_radius_m",
+    "cluster_radius_m", "fetched_utc", "raw_osm_ids", "cluster_size",
+    "snap_distance_m", "raw_signal_lat", "raw_signal_lon", "signal_type",
+    "osm_tags",
+]
+
+
+def _signal_event_cache_path(summary_path):
+    """Default event cache path next to the summary count cache."""
+    path = Path(summary_path)
+    return path.with_name("traffic_signal_events.csv")
+
+
+def _signal_lat_lon(signal):
+    if isinstance(signal, dict):
+        return float(signal["lat"]), float(signal["lon"])
+    return float(signal[0]), float(signal[1])
+
+
+def _signal_record(signal):
+    lat, lon = _signal_lat_lon(signal)
+    if isinstance(signal, dict):
+        return {
+            "lat": lat,
+            "lon": lon,
+            "osm_id": signal.get("osm_id", ""),
+            "signal_type": signal.get("signal_type", ""),
+            "tags": signal.get("tags") or {},
+        }
+    return {"lat": lat, "lon": lon, "osm_id": "", "signal_type": "", "tags": {}}
+
+
+def _segment_geometry_id(from_id, to_id, shape_id=None, poly=None):
+    """
+    Stable directed geometry identity.
+
+    GTFS shape_id is the smallest existing stable key that distinguishes normal
+    shape variants for the same stop pair. When no shape_id is available, we use
+    a rounded polyline hash so chord/shape-less geometry variants do not collide.
+    """
+    f, t = str(from_id), str(to_id)
+    shape_id = "" if shape_id is None else str(shape_id)
+    if shape_id:
+        base = f"shape:{shape_id}"
+    else:
+        coords = ";".join(f"{float(la):.7f},{float(lo):.7f}" for la, lo in (poly or []))
+        digest = hashlib.blake2s(coords.encode("utf-8"), digest_size=8).hexdigest()
+        base = f"geom:{digest}"
+    return f"{base}|{f}|{t}"
+
+
+def _pair_fields(pair):
+    """Return (geometry_id, from_id, to_id, length_m, shape_id) for old/new pairs."""
+    if len(pair) >= 5:
+        gid, f, t, length_m, shape_id = pair[:5]
+        return str(gid), str(f), str(t), float(length_m), str(shape_id or "")
+    f, t, length_m = pair[:3]
+    return (str(f), str(t)), str(f), str(t), float(length_m), ""
+
+
+def _geom_for_pair(geom_map, geometry_id, from_id, to_id):
+    if not geom_map:
+        return None
+    return geom_map.get(geometry_id) or geom_map.get((from_id, to_id))
 
 
 # -----------------------------------------------------------------------------
@@ -127,6 +198,32 @@ def _clustered_count(positions_m, cluster_radius_m=DEFAULT_SIGNAL_CLUSTER_RADIUS
     return clusters
 
 
+def _cluster_positions(positions_m, cluster_radius_m=DEFAULT_SIGNAL_CLUSTER_RADIUS_M):
+    """
+    Cluster projected positions with the same single-link rule as _clustered_count.
+
+    The representative event position is the median projected distance of the
+    cluster members. This is stable, robust to multi-node junction mapping, and
+    always lies on the directed route geometry after interpolation.
+    """
+    if not positions_m:
+        return []
+    ordered = sorted(float(p) for p in positions_m)
+    if cluster_radius_m is None or cluster_radius_m <= 0:
+        return [[p] for p in ordered]
+
+    clusters, cur, last = [], [], None
+    for pos in ordered:
+        if last is None or pos - last <= cluster_radius_m:
+            cur.append(pos)
+        else:
+            clusters.append(cur)
+            cur = [pos]
+        last = pos
+    clusters.append(cur)
+    return clusters
+
+
 def _pair_signal_positions(a_ll, b_ll, signals, snap_radius_m):
     """
     Project matched signal nodes to positions along the directed pair A->B.
@@ -140,7 +237,8 @@ def _pair_signal_positions(a_ll, b_ll, signals, snap_radius_m):
     blat, blon = b_ll
     length_m = _haversine_m(alat, alon, blat, blon)
     positions = []
-    for slat, slon in signals:
+    for signal in signals:
+        slat, slon = _signal_lat_lon(signal)
         d, t = _project_point_to_segment(slat, slon, alat, alon, blat, blon)
         if d <= snap_radius_m and 0.0 <= t < 1.0:
             positions.append(max(t, 0.0) * length_m)
@@ -188,7 +286,8 @@ def _polyline_signal_positions(poly, signals, snap_radius_m):
     if len(poly) < 2:
         return 0
     positions = []
-    for slat, slon in signals:
+    for signal in signals:
+        slat, slon = _signal_lat_lon(signal)
         d, along, total = _point_to_polyline(slat, slon, poly)
         if d <= snap_radius_m and total > 0.0 and 0.0 <= along < total:
             positions.append(along)
@@ -213,6 +312,112 @@ def _count_with_relaxed_snap(primary_positions, relaxed_positions,
         return n_primary, False
     n_relaxed = _clustered_count(relaxed_positions, cluster_radius_m)
     return n_relaxed, n_relaxed > 0
+
+
+def _interp_on_polyline(poly, along_m):
+    """Route coordinate at `along_m` metres along [(lat, lon), ...]."""
+    if not poly:
+        return None
+    if len(poly) == 1 or along_m <= 0:
+        return poly[0]
+    acc = 0.0
+    for (lat0, lon0), (lat1, lon1) in zip(poly[:-1], poly[1:]):
+        seg_len = _haversine_m(lat0, lon0, lat1, lon1)
+        if acc + seg_len >= along_m and seg_len > 0:
+            f = (along_m - acc) / seg_len
+            return (lat0 + f * (lat1 - lat0), lon0 + f * (lon1 - lon0))
+        acc += seg_len
+    return poly[-1]
+
+
+def _median(values):
+    vals = sorted(float(v) for v in values)
+    mid = len(vals) // 2
+    if len(vals) % 2:
+        return vals[mid]
+    return 0.5 * (vals[mid - 1] + vals[mid])
+
+
+def _signal_matches_on_polyline(poly, signals, snap_radius_m):
+    """
+    Matched raw signals with projected along-route distance and snap distance.
+
+    Keeps the existing half-open [0, total) ownership rule at segment boundaries.
+    """
+    if len(poly) < 2:
+        return []
+    matches = []
+    for signal in signals:
+        rec = _signal_record(signal)
+        d, along, total = _point_to_polyline(rec["lat"], rec["lon"], poly)
+        if d <= snap_radius_m and total > 0.0 and 0.0 <= along < total:
+            matches.append({**rec, "along_m": float(along),
+                            "snap_distance_m": float(d)})
+    return matches
+
+
+def _event_id(segment_geometry_id, distance_along_m, raw_ids, raw_coords):
+    raw = "|".join(sorted(str(x) for x in raw_ids if str(x)))
+    if not raw:
+        raw = "|".join(f"{lat:.7f},{lon:.7f}" for lat, lon in raw_coords)
+    key = f"{segment_geometry_id}|{distance_along_m:.3f}|{raw}"
+    return "sig_" + hashlib.blake2s(key.encode("utf-8"), digest_size=10).hexdigest()
+
+
+def _cluster_signal_events(segment_geometry_id, from_id, to_id, shape_id, poly,
+                           signals, source, snap_radius_m,
+                           relaxed_snap_radius_m, cluster_radius_m, fetched_utc):
+    """
+    Convert matched raw OSM points to one event per along-route cluster.
+
+    Cluster representative distance is the median member projection. signal_lat
+    and signal_lon are the route-projected coordinates at that median distance;
+    raw_signal_lat/lon retain the raw OSM point nearest to the representative.
+    """
+    matches = _signal_matches_on_polyline(
+        poly, signals, relaxed_snap_radius_m if source == "osm_relaxed" else snap_radius_m
+    )
+    clusters = _cluster_positions([m["along_m"] for m in matches], cluster_radius_m)
+    events = []
+    total_len = _point_to_polyline(poly[0][0], poly[0][1], poly)[2]
+    for cluster in clusters:
+        rep_along = _median(cluster)
+        members = [m for m in matches if m["along_m"] in set(cluster)]
+        members.sort(key=lambda m: (abs(m["along_m"] - rep_along),
+                                    m.get("osm_id", ""), m["lat"], m["lon"]))
+        rep_raw = members[0]
+        route_ll = _interp_on_polyline(poly, rep_along)
+        raw_ids = [m.get("osm_id", "") for m in members if m.get("osm_id", "")]
+        raw_coords = [(m["lat"], m["lon"]) for m in members]
+        event = {
+            "signal_event_id": _event_id(segment_geometry_id, rep_along,
+                                         raw_ids, raw_coords),
+            "segment_geometry_id": segment_geometry_id,
+            "from_stop_id": str(from_id),
+            "to_stop_id": str(to_id),
+            "shape_id": str(shape_id or ""),
+            "signal_lat": float(route_ll[0]),
+            "signal_lon": float(route_ll[1]),
+            "distance_along_segment_m": float(rep_along),
+            "segment_length_m": float(total_len),
+            "source": source,
+            "snap_radius_m": float(snap_radius_m),
+            "relaxed_snap_radius_m": float(relaxed_snap_radius_m),
+            "cluster_radius_m": float(cluster_radius_m),
+            "fetched_utc": fetched_utc,
+            "raw_osm_ids": "|".join(sorted(str(x) for x in raw_ids)),
+            "cluster_size": len(members),
+            "snap_distance_m": float(rep_raw["snap_distance_m"]),
+            "raw_signal_lat": float(rep_raw["lat"]),
+            "raw_signal_lon": float(rep_raw["lon"]),
+            "signal_type": rep_raw.get("signal_type", ""),
+            "osm_tags": json.dumps(rep_raw.get("tags") or {}, sort_keys=True),
+        }
+        if not (0.0 <= event["distance_along_segment_m"] < total_len):
+            raise ValueError("signal event position is outside segment bounds")
+        events.append(event)
+    events.sort(key=lambda e: e["distance_along_segment_m"])
+    return events
 
 
 def _interp_on_shape(shape_points, cum):
@@ -247,13 +452,14 @@ def _shape_subpath(shape_points, cum_a, cum_b):
 
 def _bbox_for_pairs(pairs, coords, pad_m, geom_map=None):
     lats, lons = [], []
-    for f, t, _l in pairs:
+    for pair in pairs:
+        gid, f, t, _l, _shape_id = _pair_fields(pair)
         for sid in (f, t):
             la, lo = coords[sid]
             lats.append(la)
             lons.append(lo)
         if geom_map:                         # include shape sub-path vertices too
-            for la, lo in geom_map.get((f, t)) or []:
+            for la, lo in _geom_for_pair(geom_map, gid, f, t) or []:
                 lats.append(la)
                 lons.append(lo)
     if not lats:
@@ -298,20 +504,43 @@ def _features_from_bbox(ox, north, south, east, west, tags):
     raise RuntimeError(" | ".join(errs))
 
 
-def _points_from_features(gdf):
+def _points_from_features(gdf, signal_type=""):
     if gdf is None:
         return []
     if getattr(gdf, "empty", False) or not hasattr(gdf, "geometry"):
         return []
 
     pts = []
-    for geom in gdf.geometry:
+    try:
+        iterator = gdf.iterrows()
+    except AttributeError:
+        iterator = enumerate(gdf.geometry)
+    for idx, row in iterator:
+        geom = row.geometry if hasattr(row, "geometry") else row
         if geom is None:
             continue
         p = geom if getattr(geom, "geom_type", "") == "Point" else geom.centroid
         if getattr(p, "is_empty", False):
             continue
-        pts.append((float(p.y), float(p.x)))
+        tags = {}
+        if hasattr(row, "items"):
+            for key, value in row.items():
+                if key == "geometry":
+                    continue
+                if value is not None and str(value) != "nan":
+                    tags[str(key)] = str(value)
+        osm_id = ""
+        if isinstance(idx, tuple):
+            osm_id = ":".join(str(part) for part in idx)
+        elif idx is not None:
+            osm_id = str(idx)
+        pts.append({
+            "lat": float(p.y),
+            "lon": float(p.x),
+            "osm_id": osm_id,
+            "signal_type": signal_type,
+            "tags": tags,
+        })
     return pts
 
 
@@ -328,6 +557,22 @@ def _dedupe_signal_points(points, tolerance_m=OSM_SIGNAL_DEDUP_RADIUS_M):
         if all(_haversine_m(lat, lon, ulat, ulon) > tolerance_m
                for ulat, ulon in unique):
             unique.append((lat, lon))
+    return unique
+
+
+def _dedupe_signal_records(points, tolerance_m=OSM_SIGNAL_DEDUP_RADIUS_M):
+    """
+    Metadata-preserving twin of _dedupe_signal_points.
+
+    The first record wins inside the tolerance, matching the old coordinate-only
+    dedupe behaviour while retaining OSM ids/tags where the fetch exposed them.
+    """
+    unique = []
+    for signal in points:
+        rec = _signal_record(signal)
+        if all(_haversine_m(rec["lat"], rec["lon"], u["lat"], u["lon"]) > tolerance_m
+               for u in unique):
+            unique.append(rec)
     return unique
 
 
@@ -355,7 +600,8 @@ def fetch_traffic_signals_bbox(north, south, east, west, verbose=True):
     for label, tags in OSM_SIGNAL_TAG_QUERIES:
         try:
             q_pts = _points_from_features(
-                _features_from_bbox(ox, north, south, east, west, tags)
+                _features_from_bbox(ox, north, south, east, west, tags),
+                signal_type=label,
             )
             n_success += 1
             query_counts[label] = len(q_pts)
@@ -366,7 +612,7 @@ def fetch_traffic_signals_bbox(north, south, east, west, verbose=True):
         raise RuntimeError("OSM signal query failed: " + " | ".join(errs))
 
     raw_n = len(pts)
-    pts = _dedupe_signal_points(pts)
+    pts = _dedupe_signal_records(pts)
     if verbose:
         nonzero = ", ".join(f"{k}={v}" for k, v in query_counts.items() if v)
         suffix = f" ({nonzero})" if nonzero else ""
@@ -379,16 +625,20 @@ def fetch_traffic_signals_bbox(north, south, east, west, verbose=True):
 # Cache CSV I/O
 # -----------------------------------------------------------------------------
 def load_signal_cache(path):
-    """Return {(from_id, to_id): row_dict}. Empty dict if the file is absent."""
+    """Return {segment_geometry_id: row_dict}; legacy files keep (from,to) keys."""
     path = Path(path)
     cache = {}
     if not path.exists():
         return cache
     with path.open(newline="") as fh:
         for row in csv.DictReader(fh):
-            key = (str(row["from_stop_id"]), str(row["to_stop_id"]))
+            f, t = str(row["from_stop_id"]), str(row["to_stop_id"])
+            gid = row.get("segment_geometry_id") or ""
+            key = gid if gid else (f, t)
             if key in cache:
                 raise ValueError(f"duplicate signal cache row for stop pair {key}")
+            row["segment_geometry_id"] = gid
+            row["shape_id"] = row.get("shape_id") or ""
             row["n_signals"] = int(float(row["n_signals"]))
             if row["n_signals"] < 0:
                 raise ValueError(f"signal count must be non-negative for stop pair {key}")
@@ -409,14 +659,21 @@ def load_signal_cache(path):
 
 
 def save_signal_cache(path, cache):
-    """Write the merged cache dict back to CSV (one row per stop pair)."""
+    """Write the merged summary cache back to CSV (one row per geometry)."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=SIGNAL_CACHE_COLUMNS)
         w.writeheader()
-        for (f, t), row in sorted(cache.items()):
+        for key, row in sorted(cache.items(), key=lambda item: str(item[0])):
+            f = str(row.get("from_stop_id") or (key[0] if isinstance(key, tuple) else ""))
+            t = str(row.get("to_stop_id") or (key[1] if isinstance(key, tuple) else ""))
+            gid = row.get("segment_geometry_id") or (
+                "" if isinstance(key, tuple) else str(key)
+            )
             w.writerow({
+                "segment_geometry_id": gid,
+                "shape_id": row.get("shape_id", ""),
                 "from_stop_id": f, "to_stop_id": t,
                 "n_signals": int(row["n_signals"]), "source": row["source"],
                 "snap_radius_m": row["snap_radius_m"],
@@ -428,6 +685,105 @@ def save_signal_cache(path, cache):
     return path
 
 
+def load_signal_event_cache(path):
+    """Return {segment_geometry_id: [event_row, ...]}. Empty if absent."""
+    path = Path(path)
+    events = {}
+    if not path.exists():
+        return events
+    with path.open(newline="") as fh:
+        for row in csv.DictReader(fh):
+            gid = str(row["segment_geometry_id"])
+            row["signal_lat"] = float(row["signal_lat"])
+            row["signal_lon"] = float(row["signal_lon"])
+            row["distance_along_segment_m"] = float(row["distance_along_segment_m"])
+            row["segment_length_m"] = float(row["segment_length_m"])
+            row["snap_radius_m"] = float(row["snap_radius_m"])
+            row["relaxed_snap_radius_m"] = float(row.get("relaxed_snap_radius_m") or 0.0)
+            row["cluster_radius_m"] = float(row.get("cluster_radius_m") or 0.0)
+            row["cluster_size"] = int(float(row.get("cluster_size") or 1))
+            row["snap_distance_m"] = float(row.get("snap_distance_m") or 0.0)
+            row["raw_signal_lat"] = float(row.get("raw_signal_lat") or row["signal_lat"])
+            row["raw_signal_lon"] = float(row.get("raw_signal_lon") or row["signal_lon"])
+            if not (0.0 <= row["distance_along_segment_m"] < row["segment_length_m"]):
+                raise ValueError(
+                    f"signal event {row['signal_event_id']} is outside segment bounds"
+                )
+            events.setdefault(gid, []).append(row)
+    for rows in events.values():
+        rows.sort(key=lambda r: r["distance_along_segment_m"])
+    return events
+
+
+def save_signal_event_cache(path, event_cache):
+    """Write one row per clustered, route-projected signal event."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = []
+    if isinstance(event_cache, dict):
+        for group in event_cache.values():
+            rows.extend(group)
+    else:
+        rows = list(event_cache)
+    rows.sort(key=lambda r: (
+        str(r.get("segment_geometry_id", "")),
+        float(r.get("distance_along_segment_m", 0.0)),
+        str(r.get("signal_event_id", "")),
+    ))
+    with path.open("w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=SIGNAL_EVENT_CACHE_COLUMNS)
+        w.writeheader()
+        for row in rows:
+            w.writerow({col: row.get(col, "") for col in SIGNAL_EVENT_CACHE_COLUMNS})
+    return path
+
+
+def _event_consistency_check(summary_cache, event_cache):
+    for key, row in summary_cache.items():
+        if row.get("source") == "fallback":
+            continue
+        gid = row.get("segment_geometry_id") or (
+            "" if isinstance(key, tuple) else str(key)
+        )
+        if not gid or gid not in event_cache:
+            continue
+        n_events = len(event_cache.get(gid, []))
+        if int(row["n_signals"]) != n_events:
+            raise ValueError(
+                f"signal count/event mismatch for {gid}: "
+                f"n_signals={row['n_signals']} event_rows={n_events}"
+            )
+
+
+def _raw_equivalent(e1, e2):
+    ids1 = {x for x in str(e1.get("raw_osm_ids", "")).split("|") if x}
+    ids2 = {x for x in str(e2.get("raw_osm_ids", "")).split("|") if x}
+    if ids1 and ids2 and ids1 & ids2:
+        return True
+    return _haversine_m(
+        float(e1.get("raw_signal_lat", e1["signal_lat"])),
+        float(e1.get("raw_signal_lon", e1["signal_lon"])),
+        float(e2.get("raw_signal_lat", e2["signal_lat"])),
+        float(e2.get("raw_signal_lon", e2["signal_lon"])),
+    ) <= OSM_SIGNAL_DEDUP_RADIUS_M
+
+
+def _adjacent_raw_duplicate_count(event_cache):
+    rows = []
+    for group in event_cache.values():
+        rows.extend(group)
+    count = 0
+    for i, e1 in enumerate(rows):
+        for e2 in rows[i + 1:]:
+            adjacent = (
+                e1.get("to_stop_id") == e2.get("from_stop_id")
+                or e2.get("to_stop_id") == e1.get("from_stop_id")
+            )
+            if adjacent and _raw_equivalent(e1, e2):
+                count += 1
+    return count
+
+
 # -----------------------------------------------------------------------------
 # Cache-aware resolver
 # -----------------------------------------------------------------------------
@@ -437,7 +793,9 @@ def resolve_signal_counts(pairs, coords, snap_radius_m=DEFAULT_SNAP_RADIUS_M,
                           fallback_per_km=DEFAULT_FALLBACK_PER_KM,
                           fetch_fn=fetch_traffic_signals_bbox,
                           cache=None, cache_path=None, refresh=False,
-                          bbox_pad_m=150.0, geom_map=None, verbose=True):
+                          bbox_pad_m=150.0, geom_map=None,
+                          event_cache=None, event_cache_path=None,
+                          verbose=True):
     """
     Resolve n_signals for every (from_id, to_id, length_m) pair.
 
@@ -457,28 +815,48 @@ def resolve_signal_counts(pairs, coords, snap_radius_m=DEFAULT_SNAP_RADIUS_M,
     """
     if cache is None:
         cache = load_signal_cache(cache_path) if cache_path else {}
+    if event_cache is None:
+        if event_cache_path is None and cache_path is not None:
+            event_cache_path = _signal_event_cache_path(cache_path)
+        event_cache = load_signal_event_cache(event_cache_path) if event_cache_path else {}
 
     # de-duplicate pairs, remembering a length for the fallback estimate
     uniq = {}
-    for f, t, length_m in pairs:
-        uniq[(str(f), str(t))] = float(length_m)
+    for pair in pairs:
+        gid, f, t, length_m, shape_id = _pair_fields(pair)
+        uniq[gid] = (f, t, float(length_m), shape_id)
 
     count_map, source_map = {}, {}
     misses = []
     n_hit = 0
-    for key, length_m in uniq.items():
-        row = None if refresh else cache.get(key)
+    for gid, (f, t, length_m, shape_id) in uniq.items():
+        legacy_key = (f, t)
+        row_key = gid if gid in cache else legacy_key
+        row = None if refresh else cache.get(row_key)
         if (
             row is not None
             and abs(row["snap_radius_m"] - snap_radius_m) < 1e-6
             and abs(row.get("relaxed_snap_radius_m", 0.0) - relaxed_snap_radius_m) < 1e-6
             and abs(row.get("cluster_radius_m", 0.0) - cluster_radius_m) < 1e-6
         ):
-            count_map[key] = int(row["n_signals"])
-            source_map[key] = row["source"]
+            n = int(row["n_signals"])
+            if row.get("source") != "fallback" and isinstance(gid, str):
+                events = event_cache.get(gid)
+                if events is not None:
+                    n = len(events)
+                    if int(row["n_signals"]) != n:
+                        raise ValueError(
+                            f"signal count/event mismatch for {gid}: "
+                            f"n_signals={row['n_signals']} event_rows={n}"
+                        )
+            count_map[gid] = n
+            source_map[gid] = row["source"]
+            if isinstance(gid, tuple):
+                count_map[legacy_key] = n
+                source_map[legacy_key] = row["source"]
             n_hit += 1
         else:
-            misses.append((key[0], key[1], length_m))
+            misses.append((gid, f, t, length_m, shape_id))
 
     n_osm = n_osm_relaxed = n_fallback = osm_nodes = 0
     if misses:
@@ -495,10 +873,10 @@ def resolve_signal_counts(pairs, coords, snap_radius_m=DEFAULT_SNAP_RADIUS_M,
                 signals = None
 
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        for f, t, length_m in misses:
-            key = (f, t)
+        for gid, f, t, length_m, shape_id in misses:
+            legacy_key = (f, t)
             if signals is not None:
-                poly = geom_map.get((f, t)) if geom_map else None
+                poly = _geom_for_pair(geom_map, gid, f, t)
                 if poly and len(poly) >= 2:
                     primary_positions = _polyline_signal_positions(
                         poly, signals, snap_radius_m
@@ -517,6 +895,18 @@ def resolve_signal_counts(pairs, coords, snap_radius_m=DEFAULT_SNAP_RADIUS_M,
                     primary_positions, relaxed_positions, cluster_radius_m
                 )
                 source = "osm_relaxed" if used_relaxed else "osm"
+                if not poly:
+                    poly = [coords[f], coords[t]]
+                if isinstance(gid, tuple):
+                    event_gid = _segment_geometry_id(f, t, shape_id=shape_id, poly=poly)
+                else:
+                    event_gid = gid
+                events = _cluster_signal_events(
+                    event_gid, f, t, shape_id, poly, signals, source,
+                    snap_radius_m, relaxed_snap_radius_m, cluster_radius_m, now
+                )
+                n = len(events)
+                event_cache[event_gid] = events
                 if used_relaxed:
                     n_osm_relaxed += 1
                 else:
@@ -525,21 +915,49 @@ def resolve_signal_counts(pairs, coords, snap_radius_m=DEFAULT_SNAP_RADIUS_M,
                 n = int(round(fallback_per_km * length_m / 1000.0))
                 source = "fallback"
                 n_fallback += 1
-            count_map[key] = n
-            source_map[key] = source
-            cache[key] = {"n_signals": n, "source": source,
-                          "snap_radius_m": float(snap_radius_m),
-                          "relaxed_snap_radius_m": float(relaxed_snap_radius_m),
-                          "cluster_radius_m": float(cluster_radius_m),
-                          "length_m": length_m, "fetched_utc": now}
+                event_gid = gid
+            count_map[gid] = n
+            source_map[gid] = source
+            if isinstance(gid, tuple):
+                count_map[legacy_key] = n
+                source_map[legacy_key] = source
+            cache_key = legacy_key if isinstance(gid, tuple) else event_gid
+            cache[cache_key] = {
+                "segment_geometry_id": "" if isinstance(event_gid, tuple) else event_gid,
+                "shape_id": shape_id,
+                "from_stop_id": f,
+                "to_stop_id": t,
+                "n_signals": n,
+                "source": source,
+                "snap_radius_m": float(snap_radius_m),
+                "relaxed_snap_radius_m": float(relaxed_snap_radius_m),
+                "cluster_radius_m": float(cluster_radius_m),
+                "length_m": length_m,
+                "fetched_utc": now,
+            }
 
+        _event_consistency_check(cache, event_cache)
         if cache_path is not None:
             save_signal_cache(cache_path, cache)
+        if event_cache_path is not None:
+            save_signal_event_cache(event_cache_path, event_cache)
+
+    current_event_cache = {
+        gid: event_cache.get(gid, [])
+        for gid in uniq
+        if isinstance(gid, str)
+    }
+    adjacent_dupes = _adjacent_raw_duplicate_count(current_event_cache)
+    if verbose and adjacent_dupes:
+        print(f"  signals: {adjacent_dupes} adjacent raw-equivalent signal "
+              "assignment(s) retained for diagnostics")
 
     stats = {"n_pairs": len(uniq), "cache_hit": n_hit,
              "osm": n_osm, "osm_relaxed": n_osm_relaxed,
              "fallback": n_fallback,
-             "osm_nodes": osm_nodes, "total_signals": sum(count_map.values())}
+             "osm_nodes": osm_nodes, "total_signals": sum(count_map.values()),
+             "event_rows": sum(len(v) for v in current_event_cache.values()),
+             "adjacent_raw_signal_duplicates": adjacent_dupes}
     return count_map, source_map, stats
 
 
@@ -601,23 +1019,40 @@ def _pair_geometries(trip_rows, stops, shape_points=None):
     return out
 
 
-def route_stop_pairs(trip_rows_iter, stops, shape_points_by_trip=None):
+def route_stop_pairs(trip_rows_iter, stops, shape_points_by_trip=None,
+                     shape_id_by_trip=None, include_geometry_id=False):
     """
     Collect the unique directed pairs a route uses across several trips, with the
     shape sub-path for each. trip_rows_iter yields (trip_id, trip_rows). Returns
     (pairs, geom_map): pairs is [(from_id, to_id, length_m), ...] and geom_map is
     {(from_id, to_id): polyline}. OSM is then queried for the whole route at once
     and each pair is counted against its own driven path.
+
+    With include_geometry_id=True, pairs become
+    [(segment_geometry_id, from_id, to_id, length_m, shape_id), ...] and geom_map
+    is keyed by segment_geometry_id. This is used by the signal event cache so
+    the same directed stop pair on different GTFS shape variants does not share
+    spatial events.
     """
     pairs, geom_map = {}, {}
     for tid, rows in trip_rows_iter:
         sp = None if shape_points_by_trip is None else shape_points_by_trip.get(tid)
+        shape_id = "" if shape_id_by_trip is None else shape_id_by_trip.get(str(tid), "")
         for a, b, length_m, poly in _pair_geometries(rows, stops, shape_points=sp):
-            key = (a["stop_id"], b["stop_id"])
+            f, t = a["stop_id"], b["stop_id"]
+            if include_geometry_id:
+                key = _segment_geometry_id(f, t, shape_id=shape_id, poly=poly)
+            else:
+                key = (f, t)
             if key not in pairs:
-                pairs[key] = length_m
+                pairs[key] = (f, t, length_m, shape_id)
                 geom_map[key] = poly
-    return [(f, t, l) for (f, t), l in pairs.items()], geom_map
+    if include_geometry_id:
+        return [
+            (gid, f, t, l, shape_id)
+            for gid, (f, t, l, shape_id) in pairs.items()
+        ], geom_map
+    return [(f, t, l) for _key, (f, t, l, _shape_id) in pairs.items()], geom_map
 
 
 # -----------------------------------------------------------------------------
@@ -628,13 +1063,14 @@ def add_traffic_signals(segments, trip_rows, stops, count_map=None,
                         snap_radius_m=DEFAULT_SNAP_RADIUS_M,
                         relaxed_snap_radius_m=DEFAULT_RELAXED_SNAP_RADIUS_M,
                         cluster_radius_m=DEFAULT_SIGNAL_CLUSTER_RADIUS_M,
-                        shape_points=None, verbose=True):
+                        shape_points=None, shape_id=None, verbose=True):
     """
     Write Segment.n_signals (and Segment.signal_source) for one trip.
 
     Two modes:
-      * count_map given  -> pure lookup by (from_stop_id, to_stop_id). This is the
-                            pipeline path: counts already resolved once per route.
+      * count_map given  -> pure lookup by segment_geometry_id when present,
+                            falling back to the legacy (from_stop_id, to_stop_id)
+                            key for old callers/caches.
       * signals given    -> compute per-pair counts directly from OSM points
                             (handy for a one-off manual check of a single trip).
     Mirrors add_grades_from_dem: walks the same iter_valid_stop_pairs so seg i
@@ -654,7 +1090,8 @@ def add_traffic_signals(segments, trip_rows, stops, count_map=None,
         count_map, source_map = {}, {}
         for a, b, _l, poly in _pair_geometries(trip_rows, stops,
                                                shape_points=shape_points):
-            key = (a["stop_id"], b["stop_id"])
+            f, t = a["stop_id"], b["stop_id"]
+            key = _segment_geometry_id(f, t, shape_id=shape_id, poly=poly)
             primary_positions = _polyline_signal_positions(poly, signals, snap_radius_m)
             relaxed_positions = _polyline_signal_positions(
                 poly, signals, relaxed_snap_radius_m
@@ -666,8 +1103,14 @@ def add_traffic_signals(segments, trip_rows, stops, count_map=None,
             source_map[key] = "osm_relaxed" if used_relaxed else "osm"
 
     total = 0
-    for seg, (a, b, _l) in zip(segments, pairs):
-        key = (a["stop_id"], b["stop_id"])
+    for seg, (a, b, _l), (_ga, _gb, _gl, poly) in zip(
+        segments, pairs, _pair_geometries(trip_rows, stops, shape_points=shape_points)
+    ):
+        legacy_key = (a["stop_id"], b["stop_id"])
+        geom_key = _segment_geometry_id(
+            a["stop_id"], b["stop_id"], shape_id=shape_id, poly=poly
+        )
+        key = geom_key if geom_key in count_map else legacy_key
         seg.n_signals = int(count_map.get(key, 0))
         seg.signal_source = (source_map or {}).get(key, "none")
         total += seg.n_signals

@@ -27,6 +27,7 @@ _BUILTIN_DEFAULTS: dict[str, Any] = {
         "gtfs_output_dir": "data/processed",
         "srtm_cache_dir": "data/srtm_cache",
         "traffic_signals_csv": "data/processed/traffic_signals.csv",
+        "traffic_signal_events_csv": "data/processed/traffic_signal_events.csv",
         "speed_caps_csv": "data/processed/speed_caps.csv",
         "synthetic_segment_results_csv": "data/processed/beb_segment_results.csv",
         "synthetic_soc_trace_png": "reports/figures/beb_soc_trace.png",
