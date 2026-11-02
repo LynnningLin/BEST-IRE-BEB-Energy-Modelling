@@ -114,6 +114,13 @@ class Segment:
     to_stop_departure_time: Optional[str] = None
     n_signals: int = 0       # OSM traffic signals on this segment (traffic_signals.py)
     signal_source: Optional[str] = None  # "osm" | "fallback" | "none"
+    segment_geometry_id: Optional[str] = None
+    shape_id: Optional[str] = None
+    trip_id: Optional[str] = None
+    service_date: Optional[str] = None
+    segment_index: Optional[int] = None
+    signal_events: Optional[list] = None
+    signal_event_diagnostics: Optional[list] = None
     # Independent PHYSICAL speed cap (speed_caps.py, OSM maxspeed). This is
     # deliberately separate from v_cruise_ms: v_cruise_ms is a GTFS-derived
     # *target* that shapes the free-flow profile, while speed_cap_ms bounds what
@@ -140,13 +147,13 @@ class SegmentEnergy:
 # Important modelling choice:
 # GTFS run_time_s is a scheduled stop-to-stop time. It normally already contains
 # average delays from junctions, pedestrian crossings, and normal traffic.
-# Therefore, when run_time_s exists, red-light waiting should be treated as an
-# internal part of that scheduled time, not as extra time added on top. Otherwise
-# the signal mode mainly increases auxiliary/HVAC energy rather than traction.
+# Therefore, preserve_schedule treats realised red-light waiting as part of the
+# scheduled time when there is enough physical moving-time budget. If the full
+# wait leaves too little budget, the wait is retained and delay is reported.
 DEFAULT_STOP_PROB = 0.5       # probability that one signal forces a full stop
 DEFAULT_RED_WAIT_S = 15.0     # seconds of idle wait per actual signal stop
 DEFAULT_SIGNAL_TIME_POLICY = "preserve_schedule"  # or "add_delay"
-DEFAULT_MAX_SIGNAL_WAIT_SHARE = 0.35              # cap idle share of run_time_s
+DEFAULT_MAX_SIGNAL_WAIT_SHARE = 0.35              # legacy compatibility only
 
 # Time-varying activation probability for mostly pedestrian-actuated signals.
 # This is a modelling assumption. Calibrate or sensitivity-test later.
@@ -212,6 +219,7 @@ class MotionParams:
     max_speed_cap_ms: float = float(
         _MOTION_DEFAULTS.get("max_speed_cap_ms", 25.0))
     stop_prob: float = float(_MOTION_DEFAULTS.get("stop_prob", DEFAULT_STOP_PROB))
+    signal_random_seed: int = int(_MOTION_DEFAULTS.get("signal_random_seed", 20260701))
     red_wait_s: float = float(
         _MOTION_DEFAULTS.get("red_wait_s", DEFAULT_RED_WAIT_S))
     signal_time_policy: str = str(
@@ -223,8 +231,41 @@ class MotionParams:
         _MOTION_DEFAULTS.get("use_hourly_signal_stop_probability", True))
     # None -> DEFAULT_STOP_PROB_BY_HOUR; {} -> constant stop_prob only.
     stop_prob_by_hour: Optional[dict] = None
+    solver_mode: str = str(_MOTION_DEFAULTS.get("solver_mode", "segment_legacy"))
+    gtfs_stop_policy: str = str(_MOTION_DEFAULTS.get("gtfs_stop_policy", "mandatory"))
+    q_stop: float = float(_MOTION_DEFAULTS.get("q_stop", 1.0))
+    gtfs_stop_random_seed: int = int(_MOTION_DEFAULTS.get("gtfs_stop_random_seed", 20260702))
+    signal_fidelity: str = str(_MOTION_DEFAULTS.get("signal_fidelity", "F2_spatial"))
+    signal_location_seed: int = int(_MOTION_DEFAULTS.get("signal_location_seed", 20260801))
+    signal_placement_index: int = 0
+    signal_behaviour_index: int = 0
+    signal_behaviour_seeds: Optional[dict] = None
 
     def __post_init__(self):
+        if self.signal_fidelity not in {"F0_none", "F1_frequency", "F1-U", "F1-J", "F2_spatial"}:
+            raise ValueError("Unknown signal_fidelity; use F0_none, F1-U, F1-J, F2_spatial or legacy F1_frequency.")
+        if self.signal_fidelity in {"F1_frequency", "F1-U", "F1-J"} and self.solver_mode != "trip_continuous":
+            raise ValueError("F1 variants require trip_continuous and a complete F2 inventory.")
+        for name in ("signal_placement_index", "signal_behaviour_index"):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 0:
+                raise ValueError(f"{name} must be a nonnegative integer.")
+        seeds = self.signal_behaviour_seeds or {}
+        if not isinstance(seeds, dict) or any(type(k) is not int or k < 0 or type(v) is not int for k, v in seeds.items()):
+            raise ValueError("signal_behaviour_seeds requires integer index/seed pairs.")
+        if self.signal_behaviour_index and self.signal_behaviour_index not in seeds:
+            raise ValueError("Nonzero behaviour index requires explicit signal_behaviour_seeds registration.")
+        if not isinstance(self.signal_location_seed, (int, np.integer)):
+            raise ValueError("signal_location_seed must be an integer.")
+        if self.solver_mode not in {"segment_legacy", "trip_continuous"}:
+            raise ValueError("solver_mode must be segment_legacy or trip_continuous.")
+        if self.gtfs_stop_policy not in {"mandatory", "conditional_structural"}:
+            raise ValueError("gtfs_stop_policy must be mandatory or conditional_structural.")
+        if self.gtfs_stop_policy == "conditional_structural" and self.solver_mode != "trip_continuous":
+            raise ValueError("conditional_structural requires trip_continuous.")
+        if not 0.0 <= self.q_stop <= 1.0:
+            raise ValueError("q_stop must lie in [0, 1].")
+        if not isinstance(self.gtfs_stop_random_seed, (int, np.integer)):
+            raise ValueError("gtfs_stop_random_seed must be an integer.")
         if self.accel_ms2 <= 0 or self.decel_ms2 <= 0 or self.dt_s <= 0:
             raise ValueError("accel_ms2, decel_ms2 and dt_s must be positive.")
         if self.default_speed_cap_ms <= 0 or self.max_speed_cap_ms <= 0:
@@ -242,6 +283,12 @@ class MotionParams:
         cfg = dict(_motion_params_cfg(config_path))
         known = {f for f in cls.__dataclass_fields__}
         return cls(**{k: v for k, v in cfg.items() if k in known and v is not None})
+
+    def behaviour_seed(self):
+        """Index zero replays the unchanged working F2 key/seed contract."""
+        if self.signal_behaviour_index == 0:
+            return self.signal_random_seed
+        return self.signal_behaviour_seeds[self.signal_behaviour_index]
 
     def resolve_cap(self, seg) -> tuple:
         """
@@ -475,6 +522,110 @@ def _signal_stop_count(seg: Segment, n_signals: int, stop_prob: float) -> int:
     )
 
 
+def _signal_events_for_segment(seg: Segment):
+    events = list(getattr(seg, "signal_events", None) or [])
+    out = []
+    for event in events:
+        distance = float(event["distance_along_segment_m"])
+        length = float(event.get("segment_length_m") or seg.length_m)
+        if distance < -1e-9 or distance >= float(seg.length_m) + 1e-9:
+            raise ValueError(
+                f"signal event {event.get('signal_event_id', '')} lies outside "
+                "the segment length"
+            )
+        if length > 0 and distance >= length + 1e-9:
+            raise ValueError(
+                f"signal event {event.get('signal_event_id', '')} lies outside "
+                "its cached segment length"
+            )
+        out.append({**event, "distance_along_segment_m": max(distance, 0.0)})
+    out.sort(key=lambda e: float(e["distance_along_segment_m"]))
+    return out
+
+
+def _signal_encounter_random_value(seg: Segment, signal_event_id, seed) -> float:
+    """
+    Stable Bernoulli random value for one trip/service traversal of one signal.
+
+    The key deliberately combines the global seed, trip/service context, the
+    segment geometry, the segment timing anchor, and the event id. This makes
+    repeated inputs reproducible while treating another trip through the same
+    physical signal as a separate encounter.
+    """
+    return _stable_uniform01(
+        seed,
+        getattr(seg, "service_date", None),
+        getattr(seg, "trip_id", None),
+        getattr(seg, "segment_geometry_id", None),
+        getattr(seg, "segment_index", None),
+        getattr(seg, "from_stop_departure_time", None),
+        signal_event_id,
+    )
+
+
+def _spatial_signal_decisions(seg: Segment, events, stop_prob, seed, red_wait_s):
+    decisions = []
+    p_stop = _clamp_probability(stop_prob, stop_prob)
+    wait_s = max(float(red_wait_s), 0.0)
+    for event in events:
+        event_id = event.get("signal_event_id", "")
+        r = _signal_encounter_random_value(seg, event_id, seed)
+        stops = r < p_stop
+        decisions.append({
+            "trip_id": getattr(seg, "trip_id", None),
+            "segment_geometry_id": getattr(seg, "segment_geometry_id", None),
+            "from_stop_id": event.get("from_stop_id"),
+            "to_stop_id": event.get("to_stop_id"),
+            "signal_event_id": event_id,
+            "distance_along_segment_m": float(event["distance_along_segment_m"]),
+            "signal_lat": event.get("signal_lat"),
+            "signal_lon": event.get("signal_lon"),
+            "stop_probability": float(p_stop),
+            "random_value": float(r),
+            "stop_decision": bool(stops),
+            "red_wait_s_requested": wait_s if stops else 0.0,
+            "source": event.get("source"),
+        })
+    return decisions
+
+
+def _sub_lengths_from_stop_positions(length_m, stop_positions_m):
+    length_m = float(length_m)
+    positions = [float(p) for p in stop_positions_m]
+    for pos in positions:
+        if pos < -1e-9 or pos >= length_m + 1e-9:
+            raise ValueError("realised signal stop is outside segment bounds")
+    positions = [max(0.0, p) for p in sorted(positions)]
+    for a, b in zip(positions[:-1], positions[1:]):
+        if b - a <= 1e-9:
+            raise ValueError("duplicate realised signal stop positions create zero-length legs")
+    boundaries = [0.0] + positions + [length_m]
+    sub_lengths = [b - a for a, b in zip(boundaries[:-1], boundaries[1:])]
+    if any(l < -1e-9 for l in sub_lengths):
+        raise ValueError("signal stop positions produced a negative motion leg")
+    return [max(0.0, l) for l in sub_lengths]
+
+
+def _allocate_spatial_leg_times(sub_lengths, total_time_s, v_cap, a_accel, a_decel):
+    if total_time_s is None:
+        return [None] * len(sub_lengths)
+    min_times = [
+        _freeflow_duration(l, v_cap, a_accel, a_decel) if l > 1e-9 else 0.0
+        for l in sub_lengths
+    ]
+    min_total = sum(min_times)
+    if float(total_time_s) < min_total - 1e-9:
+        return [None] * len(sub_lengths)
+    slack = float(total_time_s) - min_total
+    positive_total = sum(l for l in sub_lengths if l > 1e-9)
+    if positive_total <= 0:
+        return [0.0] * len(sub_lengths)
+    return [
+        (min_t + slack * (l / positive_total)) if l > 1e-9 else 0.0
+        for l, min_t in zip(sub_lengths, min_times)
+    ]
+
+
 def _idle_profile(duration_s, dt):
     """Zero-speed profile block for red-light waiting."""
     duration_s = max(float(duration_s), 0.0)
@@ -531,11 +682,12 @@ def build_speed_profile(seg: Segment, a_accel=None, a_decel=None, dt=None,
                                   to signal AND no-signal segments alike.
 
     With traffic signals, the segment is split into extra stop-start sub-links.
-    In preserve_schedule mode, GTFS run_time_s remains the target total duration.
-    Red-light waiting is treated as internal schedule slack (GTFS times already
-    include average junction delay). If the assumed wait cannot fit under the
-    cap, the *modelled* wait is reduced first; only schedules that are
-    physically impossible under the cap create schedule_delay_s.
+    In preserve_schedule mode, every realised signal stop receives the full
+    red_wait_s stationary wait. The moving profile is stretched into the
+    remaining GTFS time budget when that is physically feasible; otherwise the
+    fastest legal moving profile is used and the full excess is reported as
+    schedule_delay_s. add_delay is retained as a legacy/stress policy that adds
+    signal waits on top of scheduled movement.
     """
     mp = motion_params if motion_params is not None else MotionParams()
     a_accel = mp.accel_ms2 if a_accel is None else float(a_accel)
@@ -574,22 +726,56 @@ def build_speed_profile(seg: Segment, a_accel=None, a_decel=None, dt=None,
         stop_prob_by_hour=stop_prob_by_hour,
     )
 
-    n_stops = _signal_stop_count(seg, n_signals, effective_stop_prob)
+    signal_events = _signal_events_for_segment(seg)
+    use_spatial_signals = bool(signal_events)
+    signal_event_diagnostics = []
+    realised_stop_positions = []
+    if use_spatial_signals:
+        if n_signals != len(signal_events):
+            raise ValueError(
+                "Segment.n_signals does not match associated signal events "
+                f"({n_signals} vs {len(signal_events)})"
+            )
+        signal_event_diagnostics = _spatial_signal_decisions(
+            seg, signal_events, effective_stop_prob, mp.behaviour_seed(), red_wait_s
+        )
+        realised_stop_positions = [
+            d["distance_along_segment_m"]
+            for d in signal_event_diagnostics
+            if d["stop_decision"]
+        ]
+        n_stops = len(realised_stop_positions)
+    else:
+        n_stops = _signal_stop_count(seg, n_signals, effective_stop_prob)
+    seg.signal_event_diagnostics = signal_event_diagnostics
     policy = str(signal_time_policy or "preserve_schedule")
 
     diag = {
         "n_signals": n_signals,
         "n_effective_signal_stops": n_stops,
+        "n_signal_stops": n_stops,
+        "signal_stop_probability": float(effective_stop_prob),
+        "segment_geometry_id": getattr(seg, "segment_geometry_id", None),
         "signal_hour": signal_hour,
         "signal_stop_prob": float(effective_stop_prob),
         "signal_stop_prob_default": float(stop_prob),
         "signal_stop_prob_source": signal_prob_source,
+        "signal_random_seed": mp.behaviour_seed(),
+        "signal_event_mode": "spatial" if use_spatial_signals else "legacy_count",
+        "signal_event_diagnostics": signal_event_diagnostics,
+        "realised_stop_positions_m": realised_stop_positions,
         "red_wait_s_assumed": float(red_wait_s),
         "signal_time_policy": policy,
+        "scheduled_time_s": scheduled,
         "scheduled_run_time_s": scheduled,
         "signal_wait_requested_s": 0.0,
+        "signal_wait_applied_s": 0.0,
         "signal_wait_s": 0.0,
         "signal_wait_reduced_s": 0.0,
+        "moving_time_budget_s": scheduled,
+        "minimum_feasible_moving_time_s": None,
+        "actual_moving_time_s": 0.0,
+        "actual_segment_time_s": 0.0,
         "moving_profile_time_s": 0.0,
         "actual_profile_time_s": 0.0,
         "schedule_delay_s": 0.0,
@@ -599,15 +785,19 @@ def build_speed_profile(seg: Segment, a_accel=None, a_decel=None, dt=None,
         "speed_cap_source": cap_source,
         "min_feasible_motion_time_s": None,
         "n_motion_sublinks": 1,
+        "motion_sub_lengths_m": [float(seg.length_m)],
     }
 
     if n_stops <= 0:
         min_motion = _freeflow_duration(seg.length_m, v_cap, a_accel, a_decel)
+        diag["minimum_feasible_moving_time_s"] = min_motion
         diag["min_feasible_motion_time_s"] = min_motion
         profile = _single_segment_profile(seg.length_m, scheduled,
                                           target_cruise, a_accel, a_decel,
                                           dt, v_cap=v_cap)
         actual = _profile_duration(profile)
+        diag["actual_moving_time_s"] = actual
+        diag["actual_segment_time_s"] = actual
         diag["moving_profile_time_s"] = actual
         diag["actual_profile_time_s"] = actual
         if scheduled is not None:
@@ -615,63 +805,96 @@ def build_speed_profile(seg: Segment, a_accel=None, a_decel=None, dt=None,
             diag["schedule_infeasible"] = diag["schedule_delay_s"] > 1e-6
         return (profile, diag) if return_diagnostics else profile
 
-    n_sub = n_stops + 1
-    sub_len = float(seg.length_m) / n_sub
-    min_sub_time = _freeflow_duration(sub_len, v_cap, a_accel, a_decel)
-    min_motion_total = min_sub_time * n_sub
-    requested_wait = n_stops * max(float(red_wait_s), 0.0)
-    if scheduled is not None:
-        requested_wait = min(
-            requested_wait,
-            max(float(max_signal_wait_share), 0.0) * scheduled,
+    if use_spatial_signals:
+        sub_lengths = _sub_lengths_from_stop_positions(seg.length_m, realised_stop_positions)
+        n_sub = len(sub_lengths)
+        min_motion_total = sum(
+            _freeflow_duration(l, v_cap, a_accel, a_decel) if l > 1e-9 else 0.0
+            for l in sub_lengths
         )
+    else:
+        n_sub = n_stops + 1
+        sub_len = float(seg.length_m) / n_sub
+        sub_lengths = [sub_len] * n_sub
+        min_sub_time = _freeflow_duration(sub_len, v_cap, a_accel, a_decel)
+        min_motion_total = min_sub_time * n_sub
+    requested_wait = n_stops * max(float(red_wait_s), 0.0)
+    moving_budget = None
+    if scheduled is not None:
+        moving_budget = scheduled - requested_wait if policy == "preserve_schedule" else scheduled
 
     diag.update({
         "signal_wait_requested_s": requested_wait,
+        "signal_wait_applied_s": requested_wait,
+        "signal_wait_s": requested_wait,
+        "signal_wait_reduced_s": 0.0,
+        "moving_time_budget_s": moving_budget,
+        "minimum_feasible_moving_time_s": min_motion_total,
         "min_feasible_motion_time_s": min_motion_total,
         "n_motion_sublinks": n_sub,
+        "motion_sub_lengths_m": sub_lengths,
+        "max_signal_wait_share": float(max_signal_wait_share),
     })
 
+    use_fastest_legal_motion = False
     if scheduled is not None and policy == "preserve_schedule":
-        if scheduled >= min_motion_total - 1e-9:
-            # Preserve the GTFS duration. Red-light wait is only the part of the
-            # schedule slack that can physically fit under the speed cap.
-            max_wait_that_fits = max(scheduled - min_motion_total, 0.0)
-            modeled_wait = min(requested_wait, max_wait_that_fits)
-            moving_total = scheduled - modeled_wait
-            sub_rt = moving_total / n_sub
-            idle_each_s = modeled_wait / n_stops if n_stops > 0 else 0.0
-            diag["signal_wait_s"] = modeled_wait
-            diag["signal_wait_reduced_s"] = max(requested_wait - modeled_wait, 0.0)
+        if moving_budget is not None and moving_budget >= min_motion_total - 1e-9:
+            # Preserve GTFS duration by fitting motion around the full realised
+            # signal wait.
+            moving_total = moving_budget
+            if use_spatial_signals:
+                sub_rts = _allocate_spatial_leg_times(
+                    sub_lengths, moving_total, v_cap, a_accel, a_decel
+                )
+            else:
+                sub_rts = [moving_total / n_sub] * n_sub
+            idle_each_s = requested_wait / n_stops if n_stops > 0 else 0.0
         else:
-            # Even zero signal waiting cannot fit the scheduled time with the
-            # extra stop-start cycles and speed cap. Use the fastest feasible
-            # split profile and expose the true schedule delay.
-            sub_rt = None
-            idle_each_s = 0.0
-            diag["signal_wait_s"] = 0.0
-            diag["signal_wait_reduced_s"] = requested_wait
+            # The full realised wait leaves too little scheduled time for
+            # movement. Keep the wait, use the fastest legal moving profile, and
+            # expose the schedule delay.
+            sub_rts = [None] * n_sub
+            idle_each_s = requested_wait / n_stops if n_stops > 0 else 0.0
             diag["schedule_infeasible"] = True
+            use_fastest_legal_motion = True
     else:
         # Explicit delay-adding mode, mainly for scenario/sensitivity analysis.
-        sub_rt = (scheduled / n_sub) if scheduled is not None else None
+        if use_spatial_signals:
+            sub_rts = _allocate_spatial_leg_times(
+                sub_lengths, scheduled, v_cap, a_accel, a_decel
+            )
+            use_fastest_legal_motion = scheduled is not None and any(
+                rt is None for rt in sub_rts
+            )
+        else:
+            sub_rt = (scheduled / n_sub) if scheduled is not None else None
+            sub_rts = [sub_rt] * n_sub
         idle_each_s = max(float(red_wait_s), 0.0)
-        diag["signal_wait_s"] = idle_each_s * n_stops
+        applied_wait = idle_each_s * n_stops
+        diag["signal_wait_requested_s"] = applied_wait
+        diag["signal_wait_applied_s"] = applied_wait
+        diag["signal_wait_s"] = applied_wait
 
     parts = []
     moving_time = 0.0
-    for k in range(n_sub):
-        prof = _single_segment_profile(
-            sub_len, sub_rt, target_cruise, a_accel, a_decel, dt,
-            v_cap=v_cap
-        )
-        parts.append(prof)
-        moving_time += _profile_duration(prof)
+    for k, (leg_len, leg_rt) in enumerate(zip(sub_lengths, sub_rts)):
+        if leg_len > 1e-9:
+            leg_target = (
+                v_cap if use_fastest_legal_motion and leg_rt is None else target_cruise
+            )
+            prof = _single_segment_profile(
+                leg_len, leg_rt, leg_target, a_accel, a_decel, dt,
+                v_cap=v_cap
+            )
+            parts.append(prof)
+            moving_time += _profile_duration(prof)
         if k < n_sub - 1 and idle_each_s > 0.0:
             parts.append(_idle_profile(idle_each_s, dt))
 
     profile = _concat_profile_parts(parts)
     actual = _profile_duration(profile)
+    diag["actual_moving_time_s"] = moving_time
+    diag["actual_segment_time_s"] = actual
     diag["moving_profile_time_s"] = moving_time
     diag["actual_profile_time_s"] = actual
     if scheduled is not None:
@@ -687,7 +910,8 @@ def build_speed_profile(seg: Segment, a_accel=None, a_decel=None, dt=None,
 # 3. MOTION -> ENERGY : battery energy over one segment
 # -----------------------------------------------------------------------------
 def segment_energy_breakdown_kWh(seg: Segment, p: VehicleParams, soc_start_pct=None,
-                                 motion_params: Optional[MotionParams] = None):
+                                 motion_params: Optional[MotionParams] = None,
+                                 *, profile_and_diagnostics=None):
     """
     Return battery-side energy accounting for one segment.
 
@@ -695,6 +919,10 @@ def segment_energy_breakdown_kWh(seg: Segment, p: VehicleParams, soc_start_pct=N
     downhill or braking-heavy segments because regenerative braking is counted.
     gross_consumed_kWh is traction battery draw before regen and excludes aux,
     so: net = gross_consumed + aux_energy - regen_recovered.
+
+    profile_and_diagnostics lets the trip solver supply motion already solved
+    on its event timeline. That profile excludes destination dwell, which this
+    integrator adds once. Direct calls without it retain legacy segment motion.
     """
     m = p.curb_mass_kg + seg.passengers * p.passenger_mass_kg
     theta = np.arctan(seg.grade)
@@ -706,9 +934,12 @@ def segment_energy_breakdown_kWh(seg: Segment, p: VehicleParams, soc_start_pct=N
     aux_kW = seg_aux if seg_aux is not None else p.aux_power_kW
     aux_W = aux_kW * 1000.0
 
-    (t, v, a, step_s), motion_diag = build_speed_profile(
-        seg, motion_params=motion_params, return_diagnostics=True
-    )
+    if profile_and_diagnostics is None:
+        (t, v, a, step_s), motion_diag = build_speed_profile(
+            seg, motion_params=motion_params, return_diagnostics=True
+        )
+    else:
+        (t, v, a, step_s), motion_diag = profile_and_diagnostics
 
     net_joules = 0.0
     gross_joules = 0.0
@@ -797,14 +1028,39 @@ def segment_energy_kWh(seg: Segment, p: VehicleParams, soc_start_pct=None,
 # -----------------------------------------------------------------------------
 def simulate_route(segments, p: VehicleParams, soc0_pct=100.0,
                    motion_params: Optional[MotionParams] = None):
+    mp = motion_params if motion_params is not None else MotionParams()
+    trip_profile = None
+    original_segments = None
+    if mp.signal_fidelity != "F2_spatial":
+        original_segments = list(segments)
+        segments = original_segments
+        if mp.solver_mode != "trip_continuous":
+            from signal_fidelity import prepare_signal_fidelity
+            segments = prepare_signal_fidelity(segments, mp)
+    if mp.solver_mode == "trip_continuous":
+        from trip_motion import solve_trip_motion
+        segments = list(segments)
+        trip_profile = solve_trip_motion(segments, mp)
+        if original_segments is not None:
+            segments = [interval.segment for interval in trip_profile.intervals]
     rows = []
+    raw_energy = []
     soc = soc0_pct
     cum_dist_km = 0.0
     for i, seg in enumerate(segments):
-        energy = segment_energy_breakdown_kWh(
-            seg, p, soc_start_pct=soc, motion_params=motion_params
-        )
+        if trip_profile is None:
+            energy = segment_energy_breakdown_kWh(
+                seg, p, soc_start_pct=soc, motion_params=motion_params
+            )
+        else:
+            energy = segment_energy_breakdown_kWh(
+                seg, p, soc_start_pct=soc, motion_params=mp,
+                profile_and_diagnostics=(trip_profile.segment_profiles[i],
+                                         trip_profile.segment_diagnostics[i]),
+            )
         net_E = energy.net_battery_energy_kWh
+        raw_energy.append({"net_kWh": net_E, "gross_kWh": energy.gross_consumed_kWh,
+                           "regen_kWh": energy.regen_recovered_kWh, "aux_kWh": energy.aux_energy_kWh})
         soc_before = soc
         soc -= net_E / p.battery_usable_kWh * 100.0
         soc = min(soc, 100.0)  # a real BMS caps charging at 100%
@@ -820,6 +1076,7 @@ def simulate_route(segments, p: VehicleParams, soc0_pct=100.0,
             "length_m": round(seg.length_m, 1),
             "grade_%": round(seg.grade * 100, 2),
             "passengers": seg.passengers,
+            "segment_geometry_id": getattr(seg, "segment_geometry_id", None),
             "n_signals": int(getattr(seg, "n_signals", 0) or 0),
             "signal_source": getattr(seg, "signal_source", None),
             "signal_hour": (energy.motion_diagnostics or {}).get("signal_hour"),
@@ -835,14 +1092,38 @@ def simulate_route(segments, p: VehicleParams, soc0_pct=100.0,
             "n_effective_signal_stops": int((energy.motion_diagnostics or {}).get(
                 "n_effective_signal_stops", 0
             )),
+            "n_signal_stops": int((energy.motion_diagnostics or {}).get(
+                "n_signal_stops", 0
+            )),
+            "signal_stop_probability": round((energy.motion_diagnostics or {}).get(
+                "signal_stop_probability", 0.0
+            ), 3),
             "signal_wait_s": round((energy.motion_diagnostics or {}).get(
                 "signal_wait_s", 0.0
             ), 3),
             "signal_wait_requested_s": round((energy.motion_diagnostics or {}).get(
                 "signal_wait_requested_s", 0.0
             ), 3),
+            "signal_wait_applied_s": round((energy.motion_diagnostics or {}).get(
+                "signal_wait_applied_s", 0.0
+            ), 3),
             "signal_wait_reduced_s": round((energy.motion_diagnostics or {}).get(
                 "signal_wait_reduced_s", 0.0
+            ), 3),
+            "scheduled_time_s": round((energy.motion_diagnostics or {}).get(
+                "scheduled_time_s", 0.0
+            ) or 0.0, 3),
+            "moving_time_budget_s": round((energy.motion_diagnostics or {}).get(
+                "moving_time_budget_s", 0.0
+            ) or 0.0, 3),
+            "minimum_feasible_moving_time_s": round((energy.motion_diagnostics or {}).get(
+                "minimum_feasible_moving_time_s", 0.0
+            ) or 0.0, 3),
+            "actual_moving_time_s": round((energy.motion_diagnostics or {}).get(
+                "actual_moving_time_s", 0.0
+            ), 3),
+            "actual_segment_time_s": round((energy.motion_diagnostics or {}).get(
+                "actual_segment_time_s", 0.0
             ), 3),
             "actual_profile_time_s": round((energy.motion_diagnostics or {}).get(
                 "actual_profile_time_s", 0.0
@@ -892,7 +1173,32 @@ def simulate_route(segments, p: VehicleParams, soc0_pct=100.0,
             "SoC_start_%": round(soc_before, 2),
             "SoC_end_%": round(soc, 2),
         })
-    return pd.DataFrame(rows)
+    result = pd.DataFrame(rows)
+    if original_segments is not None:
+        for original, prepared in zip(original_segments, segments):
+            original.signal_event_diagnostics = prepared.signal_event_diagnostics
+    if mp.signal_fidelity != "F2_spatial":
+        result["signal_fidelity"] = mp.signal_fidelity
+        if mp.signal_fidelity == "F1_frequency":
+            result["signal_location_seed"] = mp.signal_location_seed
+        if mp.signal_fidelity in {"F1-U", "F1-J"} and segments:
+            metadata = segments[0]._placement_diagnostics
+            for key, value in metadata.items():
+                result[key] = value
+            result["signal_location_seed"] = mp.signal_location_seed
+    if trip_profile is not None:
+        for key in ("solver_mode", "gtfs_stop_policy", "trip_start_time_s",
+                    "trip_arrival_time_s", "trip_departure_time_s",
+                    "cumulative_schedule_delay_s", "initial_speed_ms", "terminal_speed_ms"):
+            result[key] = [d[key] for d in trip_profile.segment_diagnostics]
+        if mp.gtfs_stop_policy == "conditional_structural" and mp.q_stop < 1.0:
+            for key in ("q_stop", "gtfs_stop_random_seed", "gtfs_from_stop_selected",
+                        "gtfs_to_stop_selected", "gtfs_to_stop_eligible", "gtfs_to_stop_reason",
+                        "signal_coincident_zero", "n_speed_valley_legs", "maximum_speed_ms"):
+                result[key] = [d[key] for d in trip_profile.segment_diagnostics]
+    result.attrs["unrounded_energy"] = raw_energy
+    result.attrs["soc_end_unrounded_pct"] = soc
+    return result
 
 
 # ----------------------------------------------------------------------------- 

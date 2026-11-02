@@ -13,6 +13,10 @@ simulation:
   # YYYY-MM-DD format.
   date: 2025-07-09
 
+  # UTC map state pinned on OSM signal and speed-cap fetches, so every route shares
+  # one snapshot. Quoted so YAML keeps it as text. Cached rows are not re-fetched.
+  osm_snapshot_utc: "2026-08-26T16:04:56Z"
+
 # ## File and Directory Paths
 paths:
   # Project data folders.
@@ -32,19 +36,33 @@ paths:
   weather_csv: data/processed/cork_weather_hourly_model_input_2021_2025_with_solar.csv
 
   # Output/cache locations for generated GTFS segment files and SRTM tiles.
+  # Route CSVs are grouped below this directory by traffic-signal mode/fidelity:
+  # traffic_signals_off/ or traffic_signals_on_<signal_fidelity>/.
   gtfs_output_dir: data/processed
+  # Accepted canonical geometry/count/inventory and structural candidate evidence.
+  # Missing registry blocks new F1-U/F1-J; cache counts do not certify N.
+  signal_placement_registry: data/processed/osm_snapshot_20260826_v2/rule_N_v1/registry.json
+  # Saved Overpass road and signal responses behind scripts/signal_inventory.py.
+  osm_responses_dir: data/processed/osm_snapshot_20260826_v2
   srtm_cache_dir: data/srtm_cache
 
   # Outputs from the synthetic example in scripts/beb_soc_model.py.
   synthetic_segment_results_csv: data/processed/beb_segment_results.csv
   synthetic_soc_trace_png: reports/figures/beb_soc_trace.png
 
+  # OSM caches below were all fetched at simulation.osm_snapshot_utc, on repaired
+  # shapes. Signals come from the N rule: run scripts/signal_inventory.py to rebuild
+  # them. Older cache files are kept for provenance: data/processed (partial fetches),
+  # osm_snapshot_20260826 (duplicates), osm_snapshot_20260826_v2/*.csv (proximity count).
   # traffic_signals_csv is used by the energy model to estimate stop-and-go losses.
-  traffic_signals_csv: data/processed/traffic_signals.csv
+  traffic_signals_csv: data/processed/osm_snapshot_20260826_v2/rule_N_v1/traffic_signals.csv
+
+  # Event-level OSM traffic-signal cache: one row per stop point.
+  traffic_signal_events_csv: data/processed/osm_snapshot_20260826_v2/rule_N_v1/traffic_signal_events.csv
 
   # speed_caps_csv caches per stop-pair physical speed caps resolved from OSM
   # maxspeed tags (scripts/speed_caps.py). Fetched once, reused across dates.
-  speed_caps_csv: data/processed/speed_caps.csv
+  speed_caps_csv: data/processed/osm_snapshot_20260826_v2/speed_caps.csv
 
 # ## Vehicle and Battery Parameters
 # These describe the representative BEB used by the energy model.
@@ -90,9 +108,25 @@ vehicle:
 
 # ## GTFS Route Processing Defaults
 gtfs:
-  # Routes used when no route is passed on the command line.
+  # Routes used when no route is passed on the command line: a short name, or an
+  # exact route_id where operators share a short name. Plain W4 is ambiguous
+  # between Waterford (below) and Dublin's "3 W4 a", so it is rejected.
   default_routes:
     - "208"
+    - "239"
+    - "E1"
+    - "S4"
+    - "WFRD W4 c b"
+    - "343"
+
+  # Phantom road removed from GTFS shapes before any distance is measured, as
+  # [keep_until, resume_at] shape_pt_sequence pairs. The two points must coincide.
+  # 5695_1073/1074 (343): 26.1 km out and back past a stop on the return road.
+  # 5501_20 (W4): a 1.2 km spur that retraces itself vertex for vertex.
+  shape_repairs:
+    "5695_1073": [[322, 967]]
+    "5695_1074": [[322, 967]]
+    "5501_20": [[328, 389]]
 
   # block = chain trips by service_id + block_id and carry SoC across the duty.
   # trip = simulate each trip independently from a full battery.
@@ -122,7 +156,7 @@ passenger_loading:
   crush_capacity: 85
 
   # Set false to skip demand loading and use gtfs.flat_passengers instead.
-  enabled: true
+  enabled: false
 
   # Spatial shape along the route: beta, trapezoid, triangular, or flat.
   load_shape: beta
@@ -163,6 +197,13 @@ traffic_signals:
   # Set true to ignore cached signal counts and re-fetch from OSM.
   refresh: false
 
+  # True stops a run on any stop pair missing from the rule inventory, rather than
+  # filling it in with the proximity count. Set false for routes outside it.
+  inventory_frozen: true
+
+  # Set true to write one diagnostics CSV row per spatial signal encounter.
+  write_event_diagnostics: false
+
 # ## Motion Profile Defaults
 # Used by beb_soc_model.build_speed_profile(). These deliberately separate three
 # concepts that used to be conflated:
@@ -172,6 +213,23 @@ traffic_signals:
 #   * physical speed cap       -- Segment.speed_cap_ms (OSM maxspeed) or
 #                                 default_speed_cap_ms; the ONLY feasibility limit
 motion:
+  # segment_legacy preserves the Phase 1-6 model. trip_continuous is experimental
+  # and currently retains compulsory full stops at every GTFS boundary (B0).
+  solver_mode: segment_legacy
+  # F1-U / F1-J require trip_continuous plus an accepted placement registry.
+  # F1_frequency retains the historical, per-trip placement algorithm.
+  signal_fidelity: F0_none
+  signal_location_seed: 20260801
+  signal_placement_index: 0
+  # b=0 preserves the working F2 seed/keys. For b>0 supply an explicit seed map.
+  signal_behaviour_index: 0
+  signal_behaviour_seeds: null
+  # B0 mandatory stops remain the default. conditional_structural requires
+  # trip_continuous and is a B1 sensitivity experiment, not calibrated behaviour.
+  gtfs_stop_policy: mandatory
+  q_stop: 1.0
+  gtfs_stop_random_seed: 20260702
+
   # Comfortable service acceleration / deceleration for a 12 m BEB.
   accel_ms2: 1.0
   decel_ms2: 1.2
@@ -190,15 +248,20 @@ motion:
   # (used when use_hourly_signal_stop_probability is false or hour is missing).
   stop_prob: 0.5
 
+  # Stable seed for event-level traffic-signal Bernoulli decisions.
+  signal_random_seed: 20260701
+
   # Seconds of idle wait per actual signal stop.
   red_wait_s: 15.0
 
-  # preserve_schedule: red-light waiting is internal schedule slack (GTFS
-  # run times already include average junction delay). add_delay: waits are
-  # added on top (sensitivity analysis only).
+  # preserve_schedule: each realised signal stop gets the full red_wait_s, then
+  # moving time is fit into the remaining GTFS budget when physically possible.
+  # If movement cannot fit, the full wait is retained and delay is reported.
+  # add_delay: legacy/stress mode that adds waits on top of scheduled movement.
   signal_time_policy: preserve_schedule
 
-  # Cap on the idle share of scheduled run time attributable to signals.
+  # Legacy compatibility field. preserve_schedule no longer clamps realised
+  # waits by schedule share; red_wait_s is the full conditional wait per stop.
   max_signal_wait_share: 0.35
 
   # Use the hour-of-day signal stop probability table.

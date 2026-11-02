@@ -63,9 +63,9 @@ from pathlib import Path
 from traffic_signals import (
     _bbox_for_pairs,
     _haversine_m,
-    _looks_like_empty_osm_response,
     _pair_geometries,
     _stop_pairs,
+    overpass_date_setting,
 )
 
 DEFAULT_SPEED_SNAP_RADIUS_M = 25.0
@@ -160,8 +160,9 @@ def _edge_speed_kmh(data):
 # OSM fetch (the only networked part; version-tolerant across OSMnx 1.x / 2.x)
 # -----------------------------------------------------------------------------
 def _graph_from_bbox(ox, north, south, east, west):
+    # OSMnx reports an overloaded Overpass as "no data", and a bus-route bbox with
+    # no drivable ways cannot be real, so every failure here is a failed fetch.
     errs = []
-    empty_seen = False
     for call in (
         # OSMnx 2.x: bbox=(left, bottom, right, top)
         lambda: ox.graph_from_bbox(bbox=(west, south, east, north),
@@ -175,32 +176,29 @@ def _graph_from_bbox(ox, north, south, east, west):
         try:
             return call()
         except Exception as e:
-            if _looks_like_empty_osm_response(e):
-                empty_seen = True
             errs.append(repr(e))
-    if empty_seen:
-        return None
     raise RuntimeError(" | ".join(errs))
 
 
-def fetch_speed_edges_bbox(north, south, east, west, verbose=True):
+def fetch_speed_edges_bbox(north, south, east, west, verbose=True, snapshot=None):
     """
     Return [(polyline [(lat, lon), ...], speed_kmh, tagged), ...] for drivable
     OSM ways in the bbox. `tagged` is True when the speed comes from an explicit
-    maxspeed tag, False when imputed from the highway class.
+    maxspeed tag, False when imputed from the highway class. snapshot pins the
+    query to one UTC OSM timestamp.
 
-    Returns [] when the bbox genuinely has no drivable ways. Raises RuntimeError
-    when OSMnx is missing or the query fails, so the caller can fall back
-    cleanly (an empty result and an infrastructure failure must not look alike).
+    Raises RuntimeError when OSMnx is missing or the query fails, so the caller
+    can fall back cleanly.
     """
     try:
         import osmnx as ox
     except ImportError as e:
         raise RuntimeError("OSMnx not installed (`pip install osmnx`)") from e
 
+    ox.settings.overpass_settings = (
+        "[out:json][timeout:{timeout}]" + overpass_date_setting(snapshot) + "{maxsize}"
+    )
     G = _graph_from_bbox(ox, north, south, east, west)
-    if G is None:
-        return []
 
     edges = []
     n_tagged = 0
@@ -474,6 +472,7 @@ def resolve_speed_caps(pairs, coords,
         row = None if refresh else cache.get(key)
         if (
             row is not None
+            and row.get("source") != "fallback"
             and abs(row["snap_radius_m"] - snap_radius_m) < 1e-6
             and abs(row["sample_step_m"] - sample_step_m) < 1e-6
         ):
@@ -526,6 +525,9 @@ def resolve_speed_caps(pairs, coords,
             cap_ms = cap_kmh / 3.6
             cap_map[key] = cap_ms
             source_map[key] = source
+            if source == "fallback":
+                # A failed fetch is retried next run, not kept as if it were data.
+                continue
             cache[key] = {
                 "speed_cap_ms": cap_ms, "speed_cap_kmh": cap_kmh,
                 "source": source, "coverage_frac": coverage,

@@ -25,14 +25,18 @@ _BUILTIN_DEFAULTS: dict[str, Any] = {
         ),
         "weather_csv": "data/processed/cork_weather_hourly_model_input_2021_2025.csv",
         "gtfs_output_dir": "data/processed",
+        "signal_placement_registry": None,
+        "osm_responses_dir": None,
         "srtm_cache_dir": "data/srtm_cache",
         "traffic_signals_csv": "data/processed/traffic_signals.csv",
+        "traffic_signal_events_csv": "data/processed/traffic_signal_events.csv",
         "speed_caps_csv": "data/processed/speed_caps.csv",
         "synthetic_segment_results_csv": "data/processed/beb_segment_results.csv",
         "synthetic_soc_trace_png": "reports/figures/beb_soc_trace.png",
     },
     "simulation": {
         "date": "2025-01-06",
+        "osm_snapshot_utc": None,
     },
     "vehicle": {
         "curb_mass_kg": 14_000.0,
@@ -53,6 +57,7 @@ _BUILTIN_DEFAULTS: dict[str, Any] = {
     },
     "gtfs": {
         "default_routes": ["208"],
+        "shape_repairs": {},
         "simulation_level": "block",
         "direction_id": 0,
         "day": "monday",
@@ -105,11 +110,22 @@ _BUILTIN_DEFAULTS: dict[str, Any] = {
         "cluster_radius_m": 35.0,
         "fallback_per_km": 2.0,
         "refresh": False,
+        "inventory_frozen": False,
+        "write_event_diagnostics": False,
     },
     # Motion-profile parameters for beb_soc_model.build_speed_profile().
     # These separate the PHYSICAL speed cap from the GTFS-derived target cruise
     # speed: the cap bounds what the vehicle may do; GTFS only shapes the target.
     "motion": {
+        "solver_mode": "segment_legacy",
+        "signal_fidelity": "F2_spatial",
+        "signal_placement_index": 0,
+        "signal_behaviour_index": 0,
+        "signal_behaviour_seeds": None,
+        "signal_location_seed": 20260801,
+        "gtfs_stop_policy": "mandatory",
+        "q_stop": 1.0,
+        "gtfs_stop_random_seed": 20260702,
         "accel_ms2": 1.0,
         "decel_ms2": 1.2,
         "dt_s": 0.5,
@@ -120,8 +136,13 @@ _BUILTIN_DEFAULTS: dict[str, Any] = {
         # 25.0 m/s = 90 km/h.
         "max_speed_cap_ms": 25.0,
         "stop_prob": 0.5,
+        "signal_random_seed": 20260701,
+        # Full conditional stationary wait per realised signal stop.
         "red_wait_s": 15.0,
+        # "preserve_schedule" fits motion around the full wait when feasible;
+        # "add_delay" is retained for legacy/stress scenarios.
         "signal_time_policy": "preserve_schedule",
+        # Legacy compatibility only; preserve_schedule no longer clamps waits.
         "max_signal_wait_share": 0.35,
         "use_hourly_signal_stop_probability": True,
         # Optional {hour: probability} mapping; None -> module default table.
@@ -337,6 +358,29 @@ def validate_config(
     _validate_vehicle_params({k: float(v) for k, v in cfg["vehicle"].items()})
 
     motion = cfg["motion"]
+    if motion["signal_fidelity"] not in {"F0_none", "F1_frequency", "F1-U", "F1-J", "F2_spatial"}:
+        raise ValueError("Unknown motion.signal_fidelity; use F0_none, F1-U, F1-J, F2_spatial or legacy F1_frequency.")
+    if motion["signal_fidelity"] in {"F1_frequency", "F1-U", "F1-J"} and motion["solver_mode"] != "trip_continuous":
+        raise ValueError("F1 variants require trip_continuous.")
+    for key in ("signal_placement_index", "signal_behaviour_index"):
+        if type(motion[key]) is not int or motion[key] < 0:
+            raise ValueError(f"motion.{key} must be a nonnegative integer.")
+    seeds = motion.get("signal_behaviour_seeds") or {}
+    if not isinstance(seeds, dict) or any(type(k) is not int or k < 0 or type(v) is not int for k, v in seeds.items()):
+        raise ValueError("motion.signal_behaviour_seeds requires integer index/seed pairs.")
+    if motion["signal_behaviour_index"] and motion["signal_behaviour_index"] not in seeds:
+        raise ValueError("A nonzero behaviour index requires an explicit signal_behaviour_seeds registration.")
+    if not isinstance(motion["signal_location_seed"], int):
+        raise ValueError("motion.signal_location_seed must be an integer.")
+    if motion["solver_mode"] not in {"segment_legacy", "trip_continuous"}:
+        raise ValueError("motion.solver_mode must be segment_legacy or trip_continuous.")
+    if motion["gtfs_stop_policy"] not in {"mandatory", "conditional_structural"}:
+        raise ValueError("motion.gtfs_stop_policy must be mandatory or conditional_structural.")
+    if motion["gtfs_stop_policy"] == "conditional_structural" and motion["solver_mode"] != "trip_continuous":
+        raise ValueError("conditional_structural requires trip_continuous.")
+    _require_interval("motion.q_stop", motion["q_stop"], 0.0, 1.0)
+    if not isinstance(motion["gtfs_stop_random_seed"], int):
+        raise ValueError("motion.gtfs_stop_random_seed must be an integer.")
     _require_positive("motion.accel_ms2", motion["accel_ms2"])
     _require_positive("motion.decel_ms2", motion["decel_ms2"])
     _require_positive("motion.dt_s", motion["dt_s"])

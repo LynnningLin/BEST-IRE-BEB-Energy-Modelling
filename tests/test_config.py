@@ -9,8 +9,8 @@ from best_ire_beb.config import (
 
 def test_default_model_config_is_loaded() -> None:
     assert get_path("gtfs_zip") == PROJECT_ROOT / "data" / "raw" / "GTFS_Realtime.zip"
-    signals_csv = PROJECT_ROOT / "data" / "processed" / "traffic_signals.csv"
-    assert get_path("traffic_signals_csv") == signals_csv
+    osm_dir = PROJECT_ROOT / "data" / "processed" / "osm_snapshot_20260826_v2"
+    assert get_path("traffic_signals_csv") == osm_dir / "rule_N_v1" / "traffic_signals.csv"
     weather_csv = PROJECT_ROOT / "data" / "processed"
     weather_csv = weather_csv / "cork_weather_hourly_model_input_2021_2025_with_solar.csv"
     assert get_path("weather_csv") == weather_csv

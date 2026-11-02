@@ -1,6 +1,7 @@
 import pandas as pd
 import pytest
 
+import gtfs_to_segment
 from gtfs_to_segment import process_routes
 
 
@@ -24,6 +25,7 @@ def _run_pipeline(tmp_path, integration_gtfs_zip, integration_tables, full_eleva
         simulation_level=simulation_level,
     )
     assert len(saved) == 1
+    assert saved[0].parent == out_dir / "traffic_signals_off"
     return pd.read_csv(saved[0])
 
 
@@ -101,3 +103,71 @@ def test_trip_pipeline_resets_soc_while_block_pipeline_does_not(
     assert list(block_starts.index) == ["t1", "t2"]
     assert block_starts.loc["t1"] == 100.0
     assert block_starts.loc["t2"] < 100.0
+
+
+def test_exact_route_id_keeps_the_real_short_name_in_results(
+    tmp_path, integration_gtfs_zip, integration_tables, full_elevation
+):
+    saved = process_routes(
+        integration_gtfs_zip, ["r1"], tmp_path, tables=integration_tables,
+        all_services=True, elevation_data=full_elevation, simulation_level="trip",
+        direction_id=None,
+    )
+
+    results = pd.read_csv(saved[0], dtype={"route_short_name": str})
+    assert saved[0].name.startswith("route_r1_")
+    assert set(results["route_short_name"]) == {"208"}
+    assert set(results["route_id"]) == {"r1"}
+
+
+@pytest.mark.parametrize("failing", ["signals", "speed_caps"])
+def test_matched_runs_refuse_fallback_inputs(
+    tmp_path, integration_gtfs_zip, integration_tables, full_elevation, monkeypatch, failing
+):
+    def offline(*args, **kwargs):
+        raise RuntimeError("offline")
+
+    def no_signals(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(
+        gtfs_to_segment,
+        "fetch_traffic_signals_bbox",
+        offline if failing == "signals" else no_signals,
+    )
+    monkeypatch.setattr(gtfs_to_segment, "fetch_speed_edges_bbox", offline)
+
+    with pytest.raises(ValueError, match="Matched comparison refuses"):
+        process_routes(
+            integration_gtfs_zip, ["208"], tmp_path, tables=integration_tables,
+            all_services=True, elevation_data=full_elevation, simulation_level="trip",
+            direction_id=None, run_records=[], signals_enabled=True,
+            speed_caps_enabled=True,
+        )
+
+
+def test_matched_runs_refuse_impossible_scheduled_speeds(
+    tmp_path, integration_gtfs_zip, integration_tables, full_elevation, monkeypatch
+):
+    monkeypatch.setattr(gtfs_to_segment, "MAX_PLAUSIBLE_SCHEDULED_KMH", 0.1)
+
+    with pytest.raises(ValueError, match="Matched comparison refuses trip"):
+        process_routes(
+            integration_gtfs_zip, ["208"], tmp_path, tables=integration_tables,
+            all_services=True, elevation_data=full_elevation, simulation_level="trip",
+            direction_id=None, run_records=[],
+        )
+
+
+def test_other_runs_only_warn_about_impossible_scheduled_speeds(
+    tmp_path, integration_gtfs_zip, integration_tables, full_elevation, monkeypatch, capsys
+):
+    monkeypatch.setattr(gtfs_to_segment, "MAX_PLAUSIBLE_SCHEDULED_KMH", 0.1)
+
+    process_routes(
+        integration_gtfs_zip, ["208"], tmp_path, tables=integration_tables,
+        all_services=True, elevation_data=full_elevation, simulation_level="trip",
+        direction_id=None,
+    )
+
+    assert "check its shape" in capsys.readouterr().out

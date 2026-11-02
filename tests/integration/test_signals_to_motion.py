@@ -47,11 +47,21 @@ def test_signal_counts_flow_to_motion_sublinks_and_wait_diagnostics(
     assert signal_diag["n_motion_sublinks"] == 2
     assert signal_diag["n_effective_signal_stops"] == 1
     assert signal_diag["signal_wait_s"] == pytest.approx(10.0)
+    assert signal_diag["signal_wait_applied_s"] == pytest.approx(10.0)
     assert signal_diag["actual_profile_time_s"] == pytest.approx(original_run_time)
-    assert reduced_diag["signal_wait_s"] < reduced_diag["signal_wait_requested_s"]
-    assert reduced_diag["signal_wait_reduced_s"] > 0.0
-    assert reduced_diag["schedule_delay_s"] == pytest.approx(0.0)
-    assert reduced_diag["actual_profile_time_s"] == pytest.approx(75.0)
+    assert reduced_diag["signal_wait_s"] == pytest.approx(
+        reduced_diag["signal_wait_requested_s"]
+    )
+    assert reduced_diag["signal_wait_applied_s"] == pytest.approx(10.0)
+    assert reduced_diag["signal_wait_reduced_s"] == pytest.approx(0.0)
+    assert reduced_diag["moving_time_budget_s"] == pytest.approx(65.0)
+    assert reduced_diag["actual_moving_time_s"] == pytest.approx(
+        reduced_diag["minimum_feasible_moving_time_s"], abs=0.01
+    )
+    assert reduced_diag["schedule_delay_s"] == pytest.approx(
+        reduced_diag["actual_profile_time_s"] - 75.0
+    )
+    assert reduced_diag["actual_profile_time_s"] > 75.0
     assert np.count_nonzero(signal_profile[1] == 0.0) > np.count_nonzero(
         no_signal_profile[1] == 0.0
     )

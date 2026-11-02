@@ -6,10 +6,13 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 .coverage
+.coverage.*
+coverage.xml
 htmlcov/
 
 # Virtual environments
 .venv/
+.v/
 venv/
 env/
 
@@ -24,6 +27,7 @@ dist/
 # Local configuration
 .env
 .DS_Store
+Thumbs.db
 
 # Project data outputs
 data/raw/*
@@ -31,5 +35,18 @@ data/processed/*
 !data/raw/.gitkeep
 !data/processed/.gitkeep
 
-# cache files
-cache/*
+# Local documentation and investigation artifacts
+/docs/
+/convergence_test/
+
+# Generated results and downloaded elevation tiles
+/outputs/
+/reports/figures/
+/beb_soc_trace.png
+/data/srtm_cache/
+
+# Local caches and temporary test runs
+/cache/
+/.pytest_tmp*/
+/pytest-cache-files-*/
+/test_tmp/

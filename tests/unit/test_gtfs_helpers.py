@@ -3,12 +3,16 @@ from datetime import date
 import pandas as pd
 import pytest
 
+from beb_soc_model import Segment
 from gtfs_to_segment import (
+    _repaired_shape_rows,
     _shape_points_with_cumdist,
     build_segments,
     gtfs_time_to_seconds,
     haversine_m,
+    implausible_intervals,
     iter_valid_stop_pairs,
+    resolve_route_id,
     seconds_to_hhmmss,
     select_trips_by_start,
     service_ids_for_date,
@@ -186,3 +190,83 @@ def test_shape_projection_haversine_fallback_duplicate_filter_and_segment_times(
         ]
     )
     assert list(iter_valid_stop_pairs(rows[:2], colocated)) == []
+
+
+def _routes_sharing_a_short_name():
+    return pd.DataFrame(
+        [
+            {"route_id": "3 W4 a", "route_short_name": "W4", "route_long_name": "Dublin"},
+            {"route_id": "WFRD W4 c b", "route_short_name": "W4", "route_long_name": "Waterford"},
+            {"route_id": "2 208 c a", "route_short_name": "208", "route_long_name": "Cork"},
+        ]
+    )
+
+
+def test_exact_route_id_selects_one_of_several_routes_sharing_a_short_name():
+    routes = _routes_sharing_a_short_name()
+
+    assert resolve_route_id(routes, "WFRD W4 c b") == ("WFRD W4 c b", "Waterford")
+    assert resolve_route_id(routes, "208") == ("2 208 c a", "Cork")
+
+
+def test_ambiguous_short_name_is_rejected_and_lists_the_route_ids():
+    with pytest.raises(ValueError, match="ambiguous") as error:
+        resolve_route_id(_routes_sharing_a_short_name(), "W4")
+
+    assert "3 W4 a" in str(error.value) and "WFRD W4 c b" in str(error.value)
+
+
+def test_unknown_route_selector_is_rejected():
+    with pytest.raises(ValueError, match="No route"):
+        resolve_route_id(_routes_sharing_a_short_name(), "999")
+
+
+def _shape_with_a_phantom_loop():
+    return [
+        (0.0, 0.0, 1),
+        (0.0, 0.001, 2),
+        (0.0, 0.002, 3),
+        (0.0, 0.003, 4),
+        (0.0, 0.002, 5),
+        (0.0, 0.001, 6),
+        (0.0, 0.002, 7),
+        (0.0, 0.003, 8),
+        (0.0, 0.004, 9),
+    ]
+
+
+def test_shape_repair_removes_a_phantom_loop_between_coincident_points():
+    rows = _shape_with_a_phantom_loop()
+
+    repaired = _repaired_shape_rows(rows, [[2, 6]])
+
+    assert [row[2] for row in repaired] == [1, 2, 6, 7, 8, 9]
+    original_m = _shape_points_with_cumdist(rows)[-1][2]
+    repaired_m = _shape_points_with_cumdist(repaired)[-1][2]
+    assert repaired_m == pytest.approx(haversine_m(0.0, 0.0, 0.0, 0.004))
+    assert original_m - repaired_m == pytest.approx(4 * haversine_m(0.0, 0.0, 0.0, 0.001))
+
+
+def test_shape_without_a_repair_is_returned_unchanged():
+    rows = _shape_with_a_phantom_loop()
+
+    assert _repaired_shape_rows(rows, None) is rows
+    assert _repaired_shape_rows(rows, []) is rows
+
+
+@pytest.mark.parametrize("repair", [[2, 7], [2, 99]], ids=["points_differ", "missing_point"])
+def test_shape_repair_fails_when_its_points_no_longer_join(repair):
+    with pytest.raises(ValueError, match="no longer joins"):
+        _repaired_shape_rows(_shape_with_a_phantom_loop(), [repair])
+
+
+def test_implausible_intervals_flags_only_impossible_schedules():
+    segments = [
+        Segment(length_m=500.0, run_time_s=60.0),
+        Segment(length_m=23_650.0, run_time_s=240.0),
+        Segment(length_m=860.0, run_time_s=30.0),
+        Segment(length_m=500.0, run_time_s=0.0),
+        Segment(length_m=500.0, run_time_s=None),
+    ]
+
+    assert implausible_intervals(segments) == [1]
