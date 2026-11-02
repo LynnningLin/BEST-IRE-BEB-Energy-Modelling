@@ -46,6 +46,7 @@ PUBLIC API
 import csv
 import hashlib
 import json
+import re
 import time
 from math import radians, cos, sin, asin, sqrt
 from pathlib import Path
@@ -66,6 +67,12 @@ OSM_SIGNAL_TAG_QUERIES = [
 ]
 
 OSM_SIGNAL_DEDUP_RADIUS_M = 2.0
+
+OVERPASS_INTERPRETER_URL = "https://overpass-api.de/api/interpreter"
+OVERPASS_USER_AGENT = "BEST-IRE-BEB-signal-fetch/1.0"
+OVERPASS_TIMEOUT_S = 180
+OVERPASS_ATTEMPTS = 4
+OVERPASS_RETRY_PAUSE_S = 60
 
 SIGNAL_CACHE_COLUMNS = [
     "segment_geometry_id", "shape_id",
@@ -257,7 +264,9 @@ def _point_to_polyline(plat, plon, poly):
 
     Returns (min_dist_m, along_m, total_len_m): the smallest perpendicular
     distance to any sub-segment, the arc-length position of that nearest foot
-    from the polyline start, and the polyline's total length.
+    from the polyline start, and the polyline's total length. A foot behind the
+    start keeps its negative position: that point belongs upstream, and clamping
+    it to zero would count it again in this interval, exactly at the stop.
     """
     if len(poly) < 2:
         return float("inf"), 0.0, 0.0
@@ -265,7 +274,7 @@ def _point_to_polyline(plat, plon, poly):
     for (alat, alon), (blat, blon) in zip(poly[:-1], poly[1:]):
         d, t = _project_point_to_segment(plat, plon, alat, alon, blat, blon)
         seg_len = _haversine_m(alat, alon, blat, blon)
-        tc = 0.0 if t < 0 else (1.0 if t > 1 else t)
+        tc = t if acc == 0.0 and t < 0 else (1.0 if t > 1 else max(t, 0.0))
         if d < best_d:
             best_d, best_along = d, acc + tc * seg_len
         acc += seg_len
@@ -473,75 +482,83 @@ def _bbox_for_pairs(pairs, coords, pad_m, geom_map=None):
 # -----------------------------------------------------------------------------
 # OSM fetch (the only networked part; version-tolerant across OSMnx 1.x / 2.x)
 # -----------------------------------------------------------------------------
-def _looks_like_empty_osm_response(exc):
-    text = str(exc).lower()
-    name = exc.__class__.__name__.lower()
-    return (
-        "insufficientresponse" in name
-        or "no data elements" in text
-        or "no matching features" in text
-        or "there are no geometries" in text
+def overpass_date_setting(snapshot):
+    """Overpass [date:...] setting for a pinned OSM snapshot; "" for current data."""
+    if not snapshot:
+        return ""
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", str(snapshot)):
+        raise ValueError(f"OSM snapshot must look like 2026-08-26T16:04:56Z: {snapshot!r}")
+    return f'[date:"{snapshot}"]'
+
+
+def _signal_query(north, south, east, west, snapshot=None):
+    """One Overpass query covering every signal tag, so coverage cannot be partial."""
+    bbox = f"{south},{west},{north},{east}"
+    selectors = "".join(
+        f'nw["{key}"="{value}"]({bbox});'
+        for _label, tags in OSM_SIGNAL_TAG_QUERIES
+        for key, value in tags.items()
+    )
+    return (f"[out:json][timeout:{OVERPASS_TIMEOUT_S}]{overpass_date_setting(snapshot)};"
+            f"({selectors});out tags geom;")
+
+
+def _overpass_elements(query):
+    """
+    Return the complete element list for one Overpass query, or raise.
+
+    Overpass can answer HTTP 200 with a runtime-error remark and partial or no
+    elements. That looks like a valid result, so a remark counts as a failure.
+    """
+    import requests
+
+    failure = None
+    for attempt in range(OVERPASS_ATTEMPTS):
+        if attempt:
+            time.sleep(OVERPASS_RETRY_PAUSE_S)
+        try:
+            response = requests.post(OVERPASS_INTERPRETER_URL, data={"data": query},
+                                     headers={"User-Agent": OVERPASS_USER_AGENT},
+                                     timeout=OVERPASS_TIMEOUT_S + 30)
+            response.raise_for_status()
+            payload = response.json()
+        except (requests.RequestException, ValueError) as e:
+            failure = repr(e)
+            continue
+        if "remark" in payload or "elements" not in payload:
+            failure = payload.get("remark", "response has no elements")
+            continue
+        return payload["elements"]
+    raise RuntimeError(
+        f"OSM signal query failed after {OVERPASS_ATTEMPTS} attempts: {failure}"
     )
 
 
-def _features_from_bbox(ox, north, south, east, west, tags):
-    # OSMnx 2.x: features_from_bbox(bbox=(left, bottom, right, top))
-    errs = []
-    empty_seen = False
-    for call in (
-        lambda: ox.features_from_bbox(bbox=(west, south, east, north), tags=tags),
-        lambda: ox.features_from_bbox(north, south, east, west, tags=tags),   # 1.x
-        lambda: ox.geometries_from_bbox(north, south, east, west, tags=tags), # <1.5
-    ):
-        try:
-            return call()
-        except Exception as e:                       # try the next signature
-            if _looks_like_empty_osm_response(e):
-                empty_seen = True
-            errs.append(repr(e))
-    if empty_seen:
-        return None
-    raise RuntimeError(" | ".join(errs))
+def _signal_label(tags):
+    """First matching label, in the order the dedupe keeps duplicate features."""
+    for label, query in OSM_SIGNAL_TAG_QUERIES:
+        if all(tags.get(key) == value for key, value in query.items()):
+            return label
+    raise ValueError(f"OSM element matches no signal tag: {tags}")
 
 
-def _points_from_features(gdf, signal_type=""):
-    if gdf is None:
-        return []
-    if getattr(gdf, "empty", False) or not hasattr(gdf, "geometry"):
-        return []
+def _point_from_element(element):
+    """Node coordinate or way centroid, with the element's identity and tags."""
+    if element["type"] == "node":
+        lat, lon = element["lat"], element["lon"]
+    else:
+        from shapely.geometry import LineString
 
-    pts = []
-    try:
-        iterator = gdf.iterrows()
-    except AttributeError:
-        iterator = enumerate(gdf.geometry)
-    for idx, row in iterator:
-        geom = row.geometry if hasattr(row, "geometry") else row
-        if geom is None:
-            continue
-        p = geom if getattr(geom, "geom_type", "") == "Point" else geom.centroid
-        if getattr(p, "is_empty", False):
-            continue
-        tags = {}
-        if hasattr(row, "items"):
-            for key, value in row.items():
-                if key == "geometry":
-                    continue
-                if value is not None and str(value) != "nan":
-                    tags[str(key)] = str(value)
-        osm_id = ""
-        if isinstance(idx, tuple):
-            osm_id = ":".join(str(part) for part in idx)
-        elif idx is not None:
-            osm_id = str(idx)
-        pts.append({
-            "lat": float(p.y),
-            "lon": float(p.x),
-            "osm_id": osm_id,
-            "signal_type": signal_type,
-            "tags": tags,
-        })
-    return pts
+        line = LineString([(p["lon"], p["lat"]) for p in element["geometry"]])
+        lat, lon = line.centroid.y, line.centroid.x
+    tags = {str(key): str(value) for key, value in element.get("tags", {}).items()}
+    return {
+        "lat": float(lat),
+        "lon": float(lon),
+        "osm_id": f"{element['type']}:{element['id']}",
+        "signal_type": _signal_label(tags),
+        "tags": tags,
+    }
 
 
 def _dedupe_signal_points(points, tolerance_m=OSM_SIGNAL_DEDUP_RADIUS_M):
@@ -576,45 +593,31 @@ def _dedupe_signal_records(points, tolerance_m=OSM_SIGNAL_DEDUP_RADIUS_M):
     return unique
 
 
-def fetch_traffic_signals_bbox(north, south, east, west, verbose=True):
+def fetch_traffic_signals_bbox(north, south, east, west, verbose=True, snapshot=None):
     """
     Return [(lat, lon), ...] for OSM signalised features in the bbox.
 
     This includes classic highway=traffic_signals nodes and signal-controlled
     pedestrian crossings such as crossing=traffic_signals, crossing:signals=yes,
     and common UK/Ireland crossing_ref values (pelican, puffin, toucan).
+    snapshot pins the query to one UTC OSM timestamp.
 
     Returns [] when the bbox genuinely has no signals. Raises RuntimeError when
-    OSMnx is missing or the query fails, so the caller can fall back cleanly
-    (an empty result and an infrastructure failure must not look the same).
+    the query fails, so the caller can fall back cleanly (an empty result and an
+    infrastructure failure must not look the same). All tags share one request,
+    so a failure can never leave one signal type silently missing.
     """
-    try:
-        import osmnx as ox
-    except ImportError as e:
-        raise RuntimeError("OSMnx not installed (`pip install osmnx`)") from e
-
-    pts = []
-    query_counts = {}
-    errs = []
-    n_success = 0
-    for label, tags in OSM_SIGNAL_TAG_QUERIES:
-        try:
-            q_pts = _points_from_features(
-                _features_from_bbox(ox, north, south, east, west, tags),
-                signal_type=label,
-            )
-            n_success += 1
-            query_counts[label] = len(q_pts)
-            pts.extend(q_pts)
-        except Exception as e:
-            errs.append(f"{label}: {e}")
-    if n_success == 0:
-        raise RuntimeError("OSM signal query failed: " + " | ".join(errs))
-
+    elements = _overpass_elements(_signal_query(north, south, east, west, snapshot))
+    rank = {label: i for i, (label, _tags) in enumerate(OSM_SIGNAL_TAG_QUERIES)}
+    pts = sorted((_point_from_element(e) for e in elements),
+                 key=lambda point: rank[point["signal_type"]])
     raw_n = len(pts)
+    counts = {}
+    for point in pts:
+        counts[point["signal_type"]] = counts.get(point["signal_type"], 0) + 1
     pts = _dedupe_signal_records(pts)
     if verbose:
-        nonzero = ", ".join(f"{k}={v}" for k, v in query_counts.items() if v)
+        nonzero = ", ".join(f"{k}={v}" for k, v in counts.items())
         suffix = f" ({nonzero})" if nonzero else ""
         print(f"  signals: fetched {len(pts)} unique OSM signal/crossing features "
               f"in bbox from {raw_n} raw feature(s){suffix}")
@@ -642,7 +645,7 @@ def load_signal_cache(path):
             row["n_signals"] = int(float(row["n_signals"]))
             if row["n_signals"] < 0:
                 raise ValueError(f"signal count must be non-negative for stop pair {key}")
-            if row.get("source") not in {"osm", "osm_relaxed", "fallback"}:
+            if row.get("source") not in {"osm", "osm_relaxed", "osm_rule", "fallback"}:
                 raise ValueError(f"invalid signal cache source for stop pair {key}")
             row["snap_radius_m"] = float(row["snap_radius_m"])
             if row["snap_radius_m"] <= 0:
@@ -795,14 +798,18 @@ def resolve_signal_counts(pairs, coords, snap_radius_m=DEFAULT_SNAP_RADIUS_M,
                           cache=None, cache_path=None, refresh=False,
                           bbox_pad_m=150.0, geom_map=None,
                           event_cache=None, event_cache_path=None,
-                          verbose=True):
+                          verbose=True, frozen=False):
     """
     Resolve n_signals for every (from_id, to_id, length_m) pair.
 
     Order of resolution per pair:
       1. cache hit  (same pair, same snap/relaxed/cluster radius, unless refresh=True)
       2. OSM        (one bbox fetch covering all misses, counts computed per pair)
-      3. fallback   (fallback_per_km * length_km, only if OSM is unavailable)
+      3. fallback   (fallback_per_km * length_km, only if OSM is unavailable; never
+                     cached, so the next run retries instead of keeping an estimate)
+
+    frozen=True makes any miss an error. A rule inventory is built offline by
+    signal_inventory.py, so a miss here would silently mix in the proximity count.
 
     geom_map ({(from_id,to_id): [(lat,lon), ...]}) carries the shape.txt driven
     path for each pair (from route_stop_pairs). When present, signals are snapped
@@ -835,6 +842,7 @@ def resolve_signal_counts(pairs, coords, snap_radius_m=DEFAULT_SNAP_RADIUS_M,
         row = None if refresh else cache.get(row_key)
         if (
             row is not None
+            and row.get("source") != "fallback"
             and abs(row["snap_radius_m"] - snap_radius_m) < 1e-6
             and abs(row.get("relaxed_snap_radius_m", 0.0) - relaxed_snap_radius_m) < 1e-6
             and abs(row.get("cluster_radius_m", 0.0) - cluster_radius_m) < 1e-6
@@ -857,6 +865,10 @@ def resolve_signal_counts(pairs, coords, snap_radius_m=DEFAULT_SNAP_RADIUS_M,
             n_hit += 1
         else:
             misses.append((gid, f, t, length_m, shape_id))
+
+    if misses and frozen:
+        raise ValueError(f"{len(misses)} stop pair(s) are missing from the frozen signal "
+                         f"inventory, e.g. {misses[0][0]}; rebuild it with signal_inventory.py.")
 
     n_osm = n_osm_relaxed = n_fallback = osm_nodes = 0
     if misses:
@@ -921,6 +933,8 @@ def resolve_signal_counts(pairs, coords, snap_radius_m=DEFAULT_SNAP_RADIUS_M,
             if isinstance(gid, tuple):
                 count_map[legacy_key] = n
                 source_map[legacy_key] = source
+            if source == "fallback":
+                continue
             cache_key = legacy_key if isinstance(gid, tuple) else event_gid
             cache[cache_key] = {
                 "segment_geometry_id": "" if isinstance(event_gid, tuple) else event_gid,
@@ -1059,7 +1073,7 @@ def route_stop_pairs(trip_rows_iter, stops, shape_points_by_trip=None,
 # Apply: set Segment.n_signals (+ Segment.signal_source)
 # -----------------------------------------------------------------------------
 def add_traffic_signals(segments, trip_rows, stops, count_map=None,
-                        source_map=None, signals=None,
+                        source_map=None, event_map=None, signals=None,
                         snap_radius_m=DEFAULT_SNAP_RADIUS_M,
                         relaxed_snap_radius_m=DEFAULT_RELAXED_SNAP_RADIUS_M,
                         cluster_radius_m=DEFAULT_SIGNAL_CLUSTER_RADIUS_M,
@@ -1111,8 +1125,25 @@ def add_traffic_signals(segments, trip_rows, stops, count_map=None,
             a["stop_id"], b["stop_id"], shape_id=shape_id, poly=poly
         )
         key = geom_key if geom_key in count_map else legacy_key
-        seg.n_signals = int(count_map.get(key, 0))
-        seg.signal_source = (source_map or {}).get(key, "none")
+        events = sorted(
+            list((event_map or {}).get(geom_key, [])),
+            key=lambda r: float(r["distance_along_segment_m"]),
+        )
+        if events:
+            cached_count = int(count_map.get(key, len(events)))
+            if cached_count != len(events):
+                raise ValueError(
+                    f"signal count/event mismatch for {geom_key}: "
+                    f"n_signals={cached_count} event_rows={len(events)}"
+                )
+            seg.n_signals = len(events)
+        else:
+            seg.n_signals = int(count_map.get(key, 0))
+        source_key = geom_key if (source_map or {}).get(geom_key) is not None else key
+        seg.signal_source = (source_map or {}).get(source_key, "none")
+        seg.segment_geometry_id = geom_key
+        seg.shape_id = str(shape_id or "")
+        seg.signal_events = events
         total += seg.n_signals
 
     if verbose:

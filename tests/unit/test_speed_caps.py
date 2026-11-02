@@ -5,6 +5,7 @@ from beb_soc_model import Segment
 from speed_caps import (
     MIN_CAP_KMH,
     _EdgeIndex,
+    _graph_from_bbox,
     _harmonic_cap_for_polyline,
     _parse_maxspeed_kmh,
     add_speed_caps,
@@ -154,3 +155,57 @@ def test_cache_round_trip_and_per_segment_assignment(tmp_path):
 
     assert segments[0].speed_cap_ms == pytest.approx(13.8889)
     assert segments[0].speed_cap_source == "osm"
+
+
+def test_cached_fallback_cap_is_retried_and_replaced():
+    poly, edges = _mixed_limit_geometry()
+    fallback = {
+        "speed_cap_ms": 50.0 / 3.6,
+        "speed_cap_kmh": 50.0,
+        "source": "fallback",
+        "coverage_frac": 0.0,
+        "snap_radius_m": 25.0,
+        "sample_step_m": 20.0,
+        "length_m": 1000.0,
+        "fetched_utc": "2026-01-01T00:00:00Z",
+    }
+    cache = {("a", "b"): fallback}
+
+    _, sources, stats = resolve_speed_caps(
+        [("a", "b", 1000.0)],
+        {"a": poly[0], "b": poly[-1]},
+        geom_map={("a", "b"): poly},
+        cache=cache,
+        fetch_fn=lambda *args, **kwargs: edges,
+        verbose=False,
+    )
+
+    assert stats["cache_hit"] == 0
+    assert sources[("a", "b")] == "osm"
+    assert cache[("a", "b")]["source"] == "osm"
+
+
+def test_failed_speed_fetch_is_not_saved_as_cached_data(tmp_path):
+    path = tmp_path / "caps.csv"
+
+    caps, sources, stats = resolve_speed_caps(
+        [("a", "b", 1000.0)],
+        {"a": (51.0, -8.0), "b": (51.01, -8.0)},
+        cache={},
+        cache_path=path,
+        fetch_fn=lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("offline")),
+        verbose=False,
+    )
+
+    assert sources[("a", "b")] == "fallback" and stats["fallback"] == 1
+    assert caps[("a", "b")] == pytest.approx(50.0 / 3.6)
+    assert load_speed_cap_cache(path) == {}
+
+
+def test_no_data_response_counts_as_a_failed_road_fetch():
+    class NoData:
+        def graph_from_bbox(self, *args, **kwargs):
+            raise ValueError("No data elements in server response.")
+
+    with pytest.raises(RuntimeError, match="No data elements"):
+        _graph_from_bbox(NoData(), 52.0, 51.0, -7.0, -8.0)

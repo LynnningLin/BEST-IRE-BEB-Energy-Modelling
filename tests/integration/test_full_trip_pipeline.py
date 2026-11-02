@@ -96,6 +96,9 @@ def test_complete_trip_pipeline_writes_auditable_result_csv(
     )
 
     assert len(saved) == 1
+    assert saved[0].parent == (
+        tmp_path / "out" / f"traffic_signals_on_{integration_motion.signal_fidelity}"
+    )
     df = pd.read_csv(saved[0])
 
     required_cols = {

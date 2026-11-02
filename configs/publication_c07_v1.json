@@ -1,0 +1,22 @@
+{
+  "version": "C07-v1.0",
+  "status": "generator contract; real-route acceptance blocked",
+  "algorithm": "C02-json-blake2s64-be-v1",
+  "key_version": "C07-keys-v1",
+  "infrastructure_seed": 20260801,
+  "namespaces": {"U": "infra-U-v1", "J": "infra-J-v1"},
+  "fixture_placement_indices": [0, 1],
+  "final_ensemble_counts_selected": false,
+  "U_key_fields": ["canonical_pattern_id", "geometry_version", "placement_index", "draw_ordinal"],
+  "J_key_fields": ["canonical_pattern_id", "geometry_version", "placement_index", "candidate_scientific_hash", "candidate_id"],
+  "position_rule": "C07-position-v1-independent-approach",
+  "real_centre_offset_low_base_high_m": null,
+  "fixture_centre_offset_low_base_high_m": [2.0, 5.0, 8.0],
+  "fixture_offset_authority": "constructed geometry: 5m approach to centre, +/-3m illustrative uncertainty; no real calibration",
+  "coverage_registration_tolerance_m": 2.0,
+  "cross_pattern_dependence": "independent layouts across distinct patterns; exact canonical equivalents share",
+  "C06_config_unchanged": "configs/publication_c06_v1.json",
+  "C06_5_decision": "FREEZE_BLOCKED_REAL_ROUTE",
+  "recommended_timestep": null,
+  "probability_wait_and_behaviour_engine": "unchanged; supplied immutable tuples only; C08 pending"
+}

@@ -47,10 +47,13 @@ from code:
 import argparse
 import csv
 import io
+import json
 import re
 import sys
 import zipfile
+from dataclasses import asdict, replace
 from datetime import date, timedelta
+from functools import partial
 from math import radians, sin, cos, asin, sqrt
 from pathlib import Path
 
@@ -91,6 +94,7 @@ try:
     from traffic_signals import (add_traffic_signals, resolve_signal_counts,
                                  route_stop_pairs, load_signal_cache,
                                  load_signal_event_cache,
+                                 fetch_traffic_signals_bbox,
                                  DEFAULT_SNAP_RADIUS_M,
                                  DEFAULT_RELAXED_SNAP_RADIUS_M,
                                  DEFAULT_SIGNAL_CLUSTER_RADIUS_M,
@@ -102,6 +106,7 @@ except ImportError:
     route_stop_pairs = None
     load_signal_cache = None
     load_signal_event_cache = None
+    fetch_traffic_signals_bbox = None
     DEFAULT_SNAP_RADIUS_M = 30.0
     DEFAULT_RELAXED_SNAP_RADIUS_M = 60.0
     DEFAULT_SIGNAL_CLUSTER_RADIUS_M = 35.0
@@ -114,6 +119,7 @@ except ImportError:
 try:
     from speed_caps import (add_speed_caps, resolve_speed_caps,
                             load_speed_cap_cache,
+                            fetch_speed_edges_bbox,
                             DEFAULT_SPEED_SNAP_RADIUS_M,
                             DEFAULT_SAMPLE_STEP_M,
                             DEFAULT_MIN_COVERAGE_FRAC,
@@ -124,6 +130,7 @@ except ImportError:
     add_speed_caps = None
     resolve_speed_caps = None
     load_speed_cap_cache = None
+    fetch_speed_edges_bbox = None
     DEFAULT_SPEED_SNAP_RADIUS_M = 25.0
     DEFAULT_SAMPLE_STEP_M = 20.0
     DEFAULT_MIN_COVERAGE_FRAC = 0.5
@@ -133,6 +140,9 @@ except ImportError:
 
 WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday",
             "saturday", "sunday"]
+
+# Above this a scheduled interval is a length defect, not a fast road.
+MAX_PLAUSIBLE_SCHEDULED_KMH = 120.0
 
 
 # -----------------------------------------------------------------------------
@@ -291,11 +301,26 @@ def validate_gtfs_feed(gtfs_zip: str):
 # -----------------------------------------------------------------------------
 # Route / service / trip selection
 # -----------------------------------------------------------------------------
-def resolve_route_id(routes, route_short_name):
-    """Resolve a human route name (e.g. '102') to (route_id, route_long_name)."""
-    match = routes[routes["route_short_name"].astype(str) == str(route_short_name)]
+def resolve_route_id(routes, route_selector):
+    """
+    Resolve an exact route_id or a route short name (e.g. '102') to
+    (route_id, route_long_name). Short names are not unique across operators, so
+    an ambiguous name is an error rather than a silent first match.
+    """
+    selector = str(route_selector)
+    match = routes[routes["route_id"].astype(str) == selector]
     if match.empty:
-        raise ValueError(f"No route with short name {route_short_name!r}")
+        match = routes[routes["route_short_name"].astype(str) == selector]
+    if match.empty:
+        raise ValueError(f"No route with route_id or short name {selector!r}")
+    if len(match) > 1:
+        options = "; ".join(
+            f"{row.route_id!r} ({row.route_long_name})"
+            for row in match.itertuples(index=False)
+        )
+        raise ValueError(
+            f"Route short name {selector!r} is ambiguous; use one route_id: {options}"
+        )
     return match.iloc[0]["route_id"], match.iloc[0]["route_long_name"]
 
 
@@ -542,12 +567,33 @@ def _shape_points_with_cumdist(rows):
     return points
 
 
-def load_shapes_for_trips(gtfs_zip: str, trips, trip_ids):
+def _repaired_shape_rows(rows, repairs):
+    """
+    Drop configured phantom sections: points strictly between each keep_until and
+    resume_at shape_pt_sequence. The two named points must coincide, so the path
+    stays continuous and a changed feed fails here rather than cutting real road.
+    """
+    if not repairs:
+        return rows
+    by_sequence = {seq: (lat, lon) for lat, lon, seq in rows}
+    for keep_until, resume_at in repairs:
+        start, end = by_sequence.get(keep_until), by_sequence.get(resume_at)
+        if start is None or end is None or haversine_m(*start, *end) > 1.0:
+            raise ValueError(
+                f"Shape repair [{keep_until}, {resume_at}] no longer joins coincident "
+                "shape points; review it against this feed."
+            )
+    return [row for row in rows
+            if not any(keep_until < row[2] < resume_at for keep_until, resume_at in repairs)]
+
+
+def load_shapes_for_trips(gtfs_zip: str, trips, trip_ids, shape_repairs=None):
     """
     Return ({shape_id: [(lat, lon, cumulative_m), ...]}, {trip_id: shape_id}).
 
     shapes.txt can be large, so this streams the zip member once and keeps only
-    the shape_ids used by the candidate trips.
+    the shape_ids used by the candidate trips. shape_repairs maps a shape_id to
+    the [keep_until, resume_at] sections to remove (see _repaired_shape_rows).
     """
     wanted_trips = set(map(str, trip_ids))
     empty = {}, {}
@@ -587,7 +633,9 @@ def load_shapes_for_trips(gtfs_zip: str, trips, trip_ids):
                 bucket.append((lat, lon, _to_int(r.get("shape_pt_sequence"))))
 
     shapes = {
-        sid: _shape_points_with_cumdist(rows)
+        sid: _shape_points_with_cumdist(
+            _repaired_shape_rows(rows, (shape_repairs or {}).get(sid))
+        )
         for sid, rows in rows_by_shape.items()
         if len(rows) >= 2
     }
@@ -815,6 +863,7 @@ def segments_for_trip(trip_rows, stops, passengers=20, elevation_data=None,
                       weather_kwargs=None, shape_points=None,
                       shape_id=None,
                       signal_count_map=None, signal_source_map=None,
+                      signal_event_map=None,
                       speed_cap_map=None, speed_cap_source_map=None,
                       verbose=False):
     """
@@ -830,6 +879,12 @@ def segments_for_trip(trip_rows, stops, passengers=20, elevation_data=None,
     segs = build_segments(
         trip_rows, stops, passengers=passengers, shape_points=shape_points
     )
+    trip_id = str(trip_rows[0].get("trip_id", "")) if trip_rows else ""
+    service_date_text = service_date.isoformat() if service_date else ""
+    for idx, seg in enumerate(segs):
+        seg.trip_id = trip_id
+        seg.service_date = service_date_text
+        seg.segment_index = idx
     segs = add_grades_from_dem(segs, trip_rows, stops,
                                elevation_data=elevation_data,
                                srtm_cache_dir=srtm_cache_dir, verbose=verbose,
@@ -841,6 +896,7 @@ def segments_for_trip(trip_rows, stops, passengers=20, elevation_data=None,
         segs = add_traffic_signals(segs, trip_rows, stops,
                                    count_map=signal_count_map,
                                    source_map=signal_source_map,
+                                   event_map=signal_event_map,
                                    shape_points=shape_points, shape_id=shape_id,
                                    verbose=verbose)
     if speed_cap_map is not None:
@@ -873,6 +929,13 @@ def segments_for_trip(trip_rows, stops, passengers=20, elevation_data=None,
 # -----------------------------------------------------------------------------
 # Results dataframes
 # -----------------------------------------------------------------------------
+def implausible_intervals(segments):
+    """Indices of intervals whose driven length cannot fit their scheduled time."""
+    return [i for i, seg in enumerate(segments)
+            if seg.run_time_s and seg.run_time_s > 0
+            and seg.length_m / seg.run_time_s * 3.6 > MAX_PLAUSIBLE_SCHEDULED_KMH]
+
+
 def trip_results_dataframe(segs, trip_info, vehicle_params=None, soc0_pct=100.0,
                            motion_params=None):
     """Simulate one trip and prepend its route/trip metadata to every row."""
@@ -881,6 +944,10 @@ def trip_results_dataframe(segs, trip_info, vehicle_params=None, soc0_pct=100.0,
     df = simulate_route(segs, vehicle_params, soc0_pct=soc0_pct,
                         motion_params=motion_params)
     for col, value in reversed(list(trip_info.items())):
+        if col in df.columns:
+            if not df[col].eq(value).all():
+                raise ValueError(f"Conflicting trip/result metadata: {col}")
+            continue
         df.insert(0, col, value)
     return df
 
@@ -928,6 +995,14 @@ def route_output_filename(route_short_name, service_date=None) -> str:
         return f"route_{route_name}_trips.csv"
     date_suffix = service_date.isoformat().replace("-", "_")
     return f"route_{route_name}_trips_{date_suffix}.csv"
+
+
+def route_signal_event_output_filename(route_short_name, service_date=None) -> str:
+    route_name = safe_route_name(route_short_name)
+    if service_date is None:
+        return f"route_{route_name}_signal_events.csv"
+    date_suffix = service_date.isoformat().replace("-", "_")
+    return f"route_{route_name}_signal_events_{date_suffix}.csv"
 
 
 def _print_route_summary(rsn, df, n_trips):
@@ -1004,11 +1079,12 @@ def process_routes(gtfs_zip, route_short_names, output_dir, tables=None,
                    loading_kwargs=None, weather_series=None, weather_kwargs=None,
                    signals_enabled=False, signals_cache_path=None,
                    signal_events_cache_path=None,
+                   signal_event_diagnostics_enabled=False,
                    signals_snap_m=DEFAULT_SNAP_RADIUS_M,
                    signals_relaxed_snap_m=DEFAULT_RELAXED_SNAP_RADIUS_M,
                    signals_cluster_m=DEFAULT_SIGNAL_CLUSTER_RADIUS_M,
                    signals_fallback_per_km=DEFAULT_FALLBACK_PER_KM,
-                   signals_refresh=False,
+                   signals_refresh=False, signals_frozen=False,
                    motion_params=None,
                    speed_caps_enabled=False, speed_caps_cache_path=None,
                    speed_caps_snap_m=DEFAULT_SPEED_SNAP_RADIUS_M,
@@ -1017,11 +1093,15 @@ def process_routes(gtfs_zip, route_short_names, output_dir, tables=None,
                    speed_caps_default_kmh=DEFAULT_FALLBACK_CAP_KMH,
                    speed_caps_max_kmh=DEFAULT_MAX_CAP_KMH,
                    speed_caps_refresh=False,
-                   simulation_level="block"):
+                   simulation_level="block", placement_registry_path=None,
+                   run_records=None, input_source_paths=(), osm_snapshot=None,
+                   shape_repairs=None):
     """
     For each route: pick trips (by service day, then by start time or ALL),
     build/simulate each, and save one CSV per route with every trip stacked
-    (columns include trip_id + trip_start_time). Returns the saved paths.
+    (columns include trip_id + trip_start_time). Results go in a subfolder of
+    output_dir named traffic_signals_off or traffic_signals_on_<signal_fidelity>.
+    Returns the saved paths.
     """
     if tables is None:
         tables = load_small_tables(gtfs_zip)
@@ -1032,6 +1112,15 @@ def process_routes(gtfs_zip, route_short_names, output_dir, tables=None,
         routes, trips, stops, calendar, calendar_dates = tables
     if vehicle_params is None:
         vehicle_params = VehicleParams()
+    if motion_params is None:
+        motion_params = MotionParams()
+    from signal_placement import (
+        F1_VARIANTS, PlacementRegistry, PlacementUnavailable, file_hash,
+        scientific_hash, source_inventory, context_evidence,
+    )
+    registered_f1 = motion_params.signal_fidelity in F1_VARIANTS
+    registry = PlacementRegistry(placement_registry_path) if registered_f1 or run_records is not None else None
+    feed_sha256 = file_hash(gtfs_zip) if registry is not None else None
 
     # 1) which service_ids count as "the day"
     if all_services or calendar is None:
@@ -1061,14 +1150,17 @@ def process_routes(gtfs_zip, route_short_names, output_dir, tables=None,
     plan, union = {}, set()
     for rsn in route_short_names:
         route_id, long_name = resolve_route_id(routes, rsn)
+        short_name = routes.loc[routes["route_id"] == route_id, "route_short_name"].iloc[0]
         tids = trips_for_route(trips, route_id, route_direction_id, service_ids)
-        plan[rsn] = (route_id, long_name, tids)
+        plan[rsn] = (route_id, long_name, tids, str(short_name))
         union.update(tids)
 
     # 3) ONE streaming pass over stop_times.txt for every wanted trip
     print(f"Scanning stop_times.txt once for {len(union)} candidate trip(s)...")
     by_trip_all = stop_times_for_trips(gtfs_zip, union)
-    shapes_by_id, shape_id_by_trip = load_shapes_for_trips(gtfs_zip, trips, union)
+    shapes_by_id, shape_id_by_trip = load_shapes_for_trips(
+        gtfs_zip, trips, union, shape_repairs
+    )
     if shapes_by_id:
         print(f"Loaded {len(shapes_by_id)} GTFS shape(s) for driven distances.")
     else:
@@ -1099,14 +1191,25 @@ def process_routes(gtfs_zip, route_short_names, output_dir, tables=None,
         stop_coords = {sid: (v["stop_lat"], v["stop_lon"]) for sid, v in _c.items()}
 
     # 4) per route: select + build + simulate + save
-    output_dir = Path(output_dir)
+    signal_folder = (
+        f"traffic_signals_on_{motion_params.signal_fidelity}"
+        if signals_enabled and _HAS_SIGNALS else "traffic_signals_off"
+    )
+    output_dir = Path(output_dir) / signal_folder
+    if registered_f1:
+        output_dir = output_dir / f"seed_{motion_params.signal_location_seed}_p{motion_params.signal_placement_index}_b{motion_params.signal_behaviour_index}_seed{motion_params.behaviour_seed()}"
     output_dir.mkdir(parents=True, exist_ok=True)
+    if registered_f1 and placement_registry_path:
+        target = output_dir / "source_registry.json"
+        if Path(placement_registry_path).resolve() != target.resolve():
+            target.write_bytes(Path(placement_registry_path).read_bytes())
     saved = []
-    for rsn, (route_id, long_name, tids) in plan.items():
+    for rsn, (route_id, long_name, tids, short_name) in plan.items():
         route_trips = {t: by_trip_all.get(t, []) for t in tids}
         route_trips = {t: r for t, r in route_trips.items() if r}
         chosen = select_trips_by_start(route_trips, start_times, tolerance_s)
         frames = []
+        signal_event_diag_rows = []
 
         # Resolve traffic-signal counts and OSM speed caps ONCE per route
         # (both static per directed stop pair): cache hit -> OSM fetch (once,
@@ -1145,11 +1248,15 @@ def process_routes(gtfs_zip, route_short_names, output_dir, tables=None,
                 relaxed_snap_radius_m=signals_relaxed_snap_m,
                 cluster_radius_m=signals_cluster_m,
                 fallback_per_km=signals_fallback_per_km,
+                fetch_fn=partial(fetch_traffic_signals_bbox, snapshot=osm_snapshot),
                 geom_map=signal_route_geom,
                 cache=signal_cache, cache_path=signals_cache_path,
                 event_cache=signal_event_cache,
                 event_cache_path=signal_events_cache_path,
-                refresh=signals_refresh, verbose=True)
+                refresh=signals_refresh, verbose=True, frozen=signals_frozen)
+            if run_records is not None and sstats["fallback"]:
+                raise ValueError(f"Matched comparison refuses estimated signals on route "
+                                 f"{rsn}: the OSM fetch failed for {sstats['fallback']} pair(s).")
             print(f"  signals: route {rsn} -> {sstats['n_pairs']} stop-pair(s) "
                   f"[cache {sstats['cache_hit']}, OSM {sstats['osm']}, "
                   f"relaxed {sstats.get('osm_relaxed', 0)}, "
@@ -1164,8 +1271,12 @@ def process_routes(gtfs_zip, route_short_names, output_dir, tables=None,
                 min_coverage_frac=speed_caps_min_coverage,
                 default_cap_kmh=speed_caps_default_kmh,
                 max_cap_kmh=speed_caps_max_kmh, geom_map=route_geom,
+                fetch_fn=partial(fetch_speed_edges_bbox, snapshot=osm_snapshot),
                 cache=speed_cap_cache, cache_path=speed_caps_cache_path,
                 refresh=speed_caps_refresh, verbose=True)
+            if run_records is not None and cstats["fallback"]:
+                raise ValueError(f"Matched comparison refuses default speed caps on route "
+                                 f"{rsn}: the OSM fetch failed for {cstats['fallback']} pair(s).")
             print(f"  speed caps: route {rsn} -> {cstats['n_pairs']} "
                   f"stop-pair(s) [cache {cstats['cache_hit']}, "
                   f"OSM {cstats['osm']}, imputed {cstats['imputed']}, "
@@ -1183,6 +1294,7 @@ def process_routes(gtfs_zip, route_short_names, output_dir, tables=None,
                 trip_start_seconds(route_trips[duty_tids[0]])
             )
             duty_soc = 100.0
+            duty_blocker = None
             for duty_trip_index, tid in enumerate(duty_tids):
                 rows = route_trips[tid]
                 trip_start_soc = duty_soc
@@ -1199,11 +1311,20 @@ def process_routes(gtfs_zip, route_short_names, output_dir, tables=None,
                     shape_id=trip_shape_id,
                     signal_count_map=route_signal_count_map,
                     signal_source_map=route_signal_source_map,
+                    signal_event_map=signal_event_cache,
                     speed_cap_map=route_speed_cap_map,
                     speed_cap_source_map=route_speed_cap_source_map,
                 )
+                implausible = implausible_intervals(segs)
+                if implausible:
+                    if run_records is not None:
+                        raise ValueError(f"Matched comparison refuses trip {tid}: interval(s) "
+                                         f"{implausible} are scheduled above "
+                                         f"{MAX_PLAUSIBLE_SCHEDULED_KMH:.0f} km/h.")
+                    print(f"  WARNING: trip {tid} interval(s) {implausible} are scheduled above "
+                          f"{MAX_PLAUSIBLE_SCHEDULED_KMH:.0f} km/h; check its shape.")
                 info = {
-                    "route_short_name": rsn,
+                    "route_short_name": short_name,
                     "route_long_name": long_name,
                     "route_id": route_id,
                     "service_id": service_by_trip.get(tid, ""),
@@ -1220,10 +1341,96 @@ def process_routes(gtfs_zip, route_short_names, output_dir, tables=None,
                     "trip_start_time": seconds_to_hhmmss(trip_start_seconds(rows)),
                     "trip_start_soc_%": round(trip_start_soc, 2),
                 }
-                frame = trip_results_dataframe(
-                    segs, info, vehicle_params, soc0_pct=trip_start_soc,
-                    motion_params=motion_params,
-                )
+                context = None
+                record = None
+                blocker = None
+                if registry is not None:
+                    binding = {"feed_sha256": feed_sha256, "route_id": str(route_id),
+                        "direction_id": str(dir_by_trip.get(tid, "")), "shape_id": str(trip_shape_id),
+                        "stop_visits": [str(row["stop_id"]) for row in rows]}
+                    pattern_id = registry.pattern_id(binding)
+                    if registered_f1:
+                        info["pattern_id"] = pattern_id
+                    physical = [{k: v for k, v in asdict(seg).items() if k not in
+                        {"n_signals", "signal_source", "signal_events", "signal_event_diagnostics"}} for seg in segs]
+                    non_signal_motion = {k: v for k, v in asdict(motion_params).items() if k not in
+                        {"signal_fidelity", "signal_location_seed", "signal_placement_index",
+                         "signal_behaviour_index", "signal_behaviour_seeds", "signal_random_seed"}}
+                    record = {"feed_sha256": feed_sha256, "route_id": str(route_id),
+                        "pattern_id": pattern_id, "trip_id": str(tid), "service_date": service_date.isoformat() if service_date else "",
+                        "fidelity": motion_params.signal_fidelity,
+                        "placement_index": motion_params.signal_placement_index if registered_f1 else None,
+                        "behaviour_index": None if motion_params.signal_fidelity == "F0_none" else motion_params.signal_behaviour_index,
+                        "analysis_mode": simulation_level, "scenario_id": "normal-GTFS-runner",
+                        "timing_rule": motion_params.signal_time_policy,
+                        "B1_stratum": f"{motion_params.gtfs_stop_policy}:q={motion_params.q_stop}:g={motion_params.gtfs_stop_random_seed}",
+                        "non_signal_input_signature": scientific_hash({"segments": physical,
+                            "vehicle": asdict(vehicle_params), "motion": non_signal_motion,
+                            "simulation_level": simulation_level, "duty_id": duty_id,
+                            "duty_initial_soc_pct": 100.0}),
+                        "source_signature": scientific_hash([asdict(seg) for seg in segs]),
+                        "registry_sha256": registry.sha256,
+                        "motion": asdict(motion_params), "vehicle": asdict(vehicle_params),
+                        "trip_start_soc_pct": trip_start_soc, "event_ledger": []}
+                    if registered_f1:
+                        try:
+                            if not signals_enabled or not _HAS_SIGNALS:
+                                raise PlacementUnavailable("BLOCKED_INVENTORY", "F1-U/J require signal extraction enabled")
+                            context = registry.bind(segs, **binding)
+                            for seg in segs:
+                                seg.signal_placement_context = context
+                            name = "pattern_" + scientific_hash(context.geometry.pattern_id)[:16] + ".json"
+                            (output_dir / name).write_text(json.dumps(context_evidence(context, motion_params),
+                                sort_keys=True, indent=2), encoding="utf-8")
+                        except PlacementUnavailable as exc:
+                            blocker = exc
+                if registered_f1 and duty_blocker is not None:
+                    blocker = PlacementUnavailable("BLOCKED_PRIOR_DUTY", duty_blocker)
+                try:
+                    if blocker:
+                        raise blocker
+                    frame = trip_results_dataframe(
+                        segs, info, vehicle_params, soc0_pct=trip_start_soc,
+                        motion_params=motion_params,
+                    )
+                except PlacementUnavailable as exc:
+                    if not registered_f1:
+                        raise
+                    if duty_blocker is None:
+                        duty_blocker = str(exc)
+                    details = {**exc.diagnostics, "placement_status": exc.status, "reason": exc.reason}
+                    frame = pd.DataFrame([{**info, "signal_fidelity": motion_params.signal_fidelity, **details}])
+                    frames.append(frame)
+                    if run_records is not None:
+                        record.update(status=exc.status, blocker=exc.reason, result=None, readiness=details)
+                        record["run_id"] = scientific_hash(record)
+                        run_records.append(record)
+                    print(f"  trip {tid}: {exc}")
+                    continue
+                if run_records is not None:
+                    raw = frame.attrs["unrounded_energy"]
+                    ledger = [dict(row) for seg in segs for row in seg.signal_event_diagnostics or []]
+                    if motion_params.signal_fidelity == "F2_spatial":
+                        try:
+                            _, ledger = source_inventory(segs, motion_params)
+                        except PlacementUnavailable:
+                            pass
+                    record.update(status="complete", blocker="", result={
+                        "net_kWh": sum(row["net_kWh"] for row in raw),
+                        "distance_m": sum(seg.length_m for seg in segs),
+                        "components": raw, "soc_end_unrounded_pct": frame.attrs["soc_end_unrounded_pct"]},
+                        event_ledger=ledger,
+                        readiness={"registered_inputs": context is not None})
+                    record["run_id"] = scientific_hash(record)
+                    run_records.append(record)
+                if signal_event_diagnostics_enabled or registered_f1:
+                    for seg_index, seg in enumerate(segs):
+                        for row in getattr(seg, "signal_event_diagnostics", None) or []:
+                            signal_event_diag_rows.append({
+                                **info,
+                                "segment": seg_index,
+                                **row,
+                            })
                 duty_soc = float(frame["SoC_end_%"].iloc[-1])
                 frame["trip_end_soc_%"] = round(duty_soc, 2)
                 frames.append(frame)
@@ -1234,7 +1441,16 @@ def process_routes(gtfs_zip, route_short_names, output_dir, tables=None,
         df = pd.concat(frames, ignore_index=True)
         out_path = output_dir / route_output_filename(rsn, service_date)
         df.to_csv(out_path, index=False)
-        _print_route_summary(rsn, df, len(chosen))
+        if registered_f1 or (signal_event_diagnostics_enabled and signal_event_diag_rows):
+            diag_path = output_dir / route_signal_event_output_filename(rsn, service_date)
+            columns = None if signal_event_diag_rows else ["trip_id", "pattern_id", "source_ordinal",
+                "synthetic_ordinal", "source_encounter_id", "candidate_id", "receiving_interval",
+                "stop_probability", "random_value", "stop_decision", "red_wait_s_requested"]
+            pd.DataFrame(signal_event_diag_rows, columns=columns).to_csv(diag_path, index=False)
+            print(f"  saved signal diagnostics: {diag_path}")
+        if "net_battery_energy_kWh" in df:
+            summary = df[df["net_battery_energy_kWh"].notna()]
+            _print_route_summary(rsn, summary, summary["trip_id"].nunique())
         print(f"  saved: {out_path}")
         saved.append(out_path)
     return saved
@@ -1385,10 +1601,22 @@ def parse_args():
         description="GTFS route short names -> per-trip BEB segment CSVs.",
         parents=[base])
     p.add_argument("route_short_names", nargs="*",
-                   help="e.g. 102 41 15 (commas allowed).")
-    p.add_argument("--routes", help="Comma-separated route short names.")
+                   help="Route short names or exact route_ids, e.g. 102 41 15 "
+                        "(commas allowed). Ambiguous short names are rejected.")
+    p.add_argument("--routes", help="Comma-separated route short names or route_ids.")
     p.add_argument("--gtfs", default=str(default_gtfs))
-    p.add_argument("--output-dir", default=str(default_output_dir))
+    p.add_argument("--output-dir", default=str(default_output_dir),
+                   help="Parent output directory; route CSVs are grouped in a "
+                        "traffic_signals_off or traffic_signals_on_<fidelity> subfolder.")
+    p.add_argument("--signal-fidelity", choices=["F0_none", "F1-U", "F1-J", "F2_spatial", "F1_frequency"],
+                   help="Override motion.signal_fidelity; F1_frequency is historical trip-keyed F1.")
+    p.add_argument("--solver-mode", choices=["segment_legacy", "trip_continuous"])
+    p.add_argument("--placement-index", type=int, help="Registered infrastructure realisation index.")
+    p.add_argument("--behaviour-index", type=int, help="Registered signal-behaviour realisation index.")
+    p.add_argument("--signal-placement-registry", default=str(get_path("signal_placement_registry", config_path) or ""),
+                   help="Versioned accepted pattern/count/inventory and candidate evidence JSON.")
+    p.add_argument("--compare-fidelities", action="store_true",
+                   help="Run matched F0/F1-U/F1-J/F2 cells and retain unavailable cases; requires trip_continuous.")
     p.add_argument("--direction-id", type=int,
                    default=int(gtfs_cfg.get("direction_id", 0)))
     p.add_argument("--any-direction", action="store_true",
@@ -1406,6 +1634,9 @@ def parse_args():
     p.add_argument("--date", default=simulation_cfg.get("date", ""),
                    help="YYYY-MM-DD scenario date. Used for weather lookup and "
                         "GTFS service selection when possible.")
+    p.add_argument("--osm-snapshot", default=simulation_cfg.get("osm_snapshot_utc"),
+                   help="UTC timestamp pinned on OSM signal/speed-cap fetches, e.g. "
+                        "2026-08-26T16:04:56Z. Only affects rows actually fetched.")
     # which trips
     p.add_argument("--start-times",
                    help="Comma-separated HH:MM[:SS]; nearest trip to each is "
@@ -1465,6 +1696,9 @@ def parse_args():
     p.add_argument("--refresh-signals", action="store_true",
                    default=bool(signals_cfg.get("refresh", False)),
                    help="Ignore cached signal counts and re-fetch from OSM.")
+    p.add_argument("--signal-event-diagnostics", action="store_true",
+                   default=bool(signals_cfg.get("write_event_diagnostics", False)),
+                   help="Write optional per-signal stop/pass diagnostics CSV.")
     # OSM speed caps (independent physical speed limit per segment)
     caps_toggle = p.add_mutually_exclusive_group()
     caps_toggle.add_argument("--speed-caps", dest="speed_caps_enabled",
@@ -1627,6 +1861,12 @@ if __name__ == "__main__":
     # OSM speed caps: config-driven with --speed-caps / --no-speed-caps as
     # one-off overrides. Static per stop pair -> fetched once, cached, reused.
     motion_params = MotionParams.from_config(args.config)
+    overrides = {key: value for key, value in {
+        "signal_fidelity": args.signal_fidelity, "solver_mode": args.solver_mode,
+        "signal_placement_index": args.placement_index,
+        "signal_behaviour_index": args.behaviour_index,
+    }.items() if value is not None}
+    motion_params = replace(motion_params, **overrides)
     speed_caps_enabled = _HAS_SPEED_CAPS and args.speed_caps_enabled
     speed_caps_cache_path = args.speed_caps_csv or None
     if not _HAS_SPEED_CAPS:
@@ -1658,7 +1898,11 @@ if __name__ == "__main__":
     elevation_data = srtm.get_data(local_cache_dir=str(args.srtm_cache_dir))
     vehicle_params = VehicleParams.from_config(args.config)
 
-    saved = process_routes(
+    runner = process_routes
+    if args.compare_fidelities:
+        from fidelity_comparison import process_fidelity_comparison
+        runner = process_fidelity_comparison
+    saved = runner(
         Path(args.gtfs), route_short_names, Path(args.output_dir), tables=tables,
         direction_id=direction_id, day=args.day, service_id=args.service_id,
         service_date=service_date,
@@ -1671,11 +1915,13 @@ if __name__ == "__main__":
         weather_series=weather_series, weather_kwargs=weather_kwargs,
         signals_enabled=signals_enabled, signals_cache_path=signals_cache_path,
         signal_events_cache_path=signal_events_cache_path,
+        signal_event_diagnostics_enabled=args.signal_event_diagnostics,
         signals_snap_m=args.signals_snap_m,
         signals_relaxed_snap_m=args.signals_relaxed_snap_m,
         signals_cluster_m=args.signals_cluster_m,
         signals_fallback_per_km=args.signals_fallback_per_km,
         signals_refresh=args.refresh_signals,
+        signals_frozen=bool(get_section("traffic_signals", args.config).get("inventory_frozen")),
         motion_params=motion_params,
         speed_caps_enabled=speed_caps_enabled,
         speed_caps_cache_path=speed_caps_cache_path,
@@ -1686,5 +1932,11 @@ if __name__ == "__main__":
         speed_caps_max_kmh=args.speed_caps_max_kmh,
         speed_caps_refresh=args.refresh_speed_caps,
         simulation_level=args.simulation_level,
+        osm_snapshot=args.osm_snapshot,
+        shape_repairs=gtfs_cfg.get("shape_repairs"),
+        placement_registry_path=args.signal_placement_registry or None,
+        input_source_paths=[args.config or PROJECT_ROOT / "configs/model.yaml", args.gtfs,
+            args.weather_csv if weather_series is not None else None,
+            found if demand_profile is not None else None],
     )
     print(f"\nProcessed {len(route_short_names)} route(s) -> {len(saved)} file(s).")
